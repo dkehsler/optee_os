@@ -17,6 +17,7 @@
 #define CLK_OPS_PARENT_ENABLE	BIT(2) /* parent need enable during re-parent */
 #define CLK_SET_RATE_PARENT	BIT(3) /* propagate rate change up one level */
 #define CLK_SET_RATE_UNGATE	BIT(4) /* clock needs to run to set rate */
+#define CLK_DUTY_CYCLE_PARENT	BIT(5) /* forward duty cycle call to parent */
 
 /**
  * struct clk - Clock structure
@@ -83,6 +84,8 @@ struct clk_duty {
  * @get_parent: Get the current parent index of the clock
  * @set_rate: Set the clock rate
  * @get_rate: Get the clock rate
+ * @get_rates_array: Get the supported clock rates as array
+ * @get_rates_steps: Get support clock rates by min/max/step representation
  */
 struct clk_ops {
 	bool (*is_enabled)(struct clk *clk);
@@ -101,6 +104,14 @@ struct clk_ops {
 				    unsigned long parent_rate);
 	TEE_Result (*determine_rate)(struct clk *clk,
 				     struct clk_rate_request *req);
+	TEE_Result (*get_rates_array)(struct clk *clk, size_t start_index,
+				      unsigned long *rates, size_t *nb_elts);
+	TEE_Result (*get_rates_steps)(struct clk *clk, unsigned long *min,
+				      unsigned long *max, unsigned long *step);
+#ifdef CFG_PM
+	TEE_Result (*save_context)(struct clk *clk);
+	void (*restore_context)(struct clk *clk);
+#endif
 };
 
 /**
@@ -158,6 +169,31 @@ unsigned long clk_get_rate(struct clk *clk);
  * Return a TEE_Result compliant value
  */
 TEE_Result clk_set_rate(struct clk *clk, unsigned long rate);
+
+/*
+ * clk_get_rates_array - Get supported rates as an array
+ *
+ * @clk: Clock for which the rates are requested
+ * @start_index: start index of requested rates
+ * @rates: Array of rates allocated by caller or NULL to query count of rates
+ * @nb_elts: Max number of elements that the array can hold as input. Contains
+ * the number of elements that was added in the array as output.
+ * Returns a TEE_Result compliant value
+ */
+TEE_Result clk_get_rates_array(struct clk *clk, size_t start_index,
+			       unsigned long *rates, size_t *nb_elts);
+
+/*
+ * clk_get_rates_steps - Get supported rates as min/max/step triplet
+ *
+ * @clk: Clock for which the rates are requested
+ * @min: Output min supported rate in Hz
+ * @max: Output max supported rate in Hz
+ * @step: Output rate step in Hz
+ * Returns a TEE_Result compliant value
+ */
+TEE_Result clk_get_rates_steps(struct clk *clk, unsigned long *min,
+			       unsigned long *max, unsigned long *step);
 
 /**
  * clk_enable - Enable a clock and its ascendance
@@ -222,6 +258,15 @@ struct clk *clk_get_parent_by_index(struct clk *clk, size_t pidx);
 TEE_Result clk_set_parent(struct clk *clk, struct clk *parent);
 
 /**
+ * clk_get_parent_idx - Get index of clock parent
+ *
+ * @clk: Clock which contains parent clocks
+ * @parent: Parent clock for which you want to known the index
+ * Return a TEE_Result compliant value and set index of the parent clock
+ */
+TEE_Result clk_get_parent_idx(struct clk *clk, struct clk *parent,
+			      size_t *pidx);
+/**
  * clk_reparent - Update clock parent
  *
  * This function mandates that clock framework is locked against
@@ -234,13 +279,13 @@ TEE_Result clk_set_parent(struct clk *clk, struct clk *parent);
 TEE_Result clk_reparent(struct clk *clk, struct clk *parent);
 
 /**
- * clk_get_duty_cyle - Get clock duty cycle
+ * clk_get_duty_cycle - Get clock duty cycle
  *
  * @clk: Clock for which the duty cycle is requested
  * @duty: Output duty cycle info
  * Return a TEE_Result compliant value
  */
-TEE_Result clk_get_duty_cyle(struct clk *clk, struct clk_duty *duty);
+TEE_Result clk_get_duty_cycle(struct clk *clk, struct clk_duty *duty);
 
 /**
  * clk_round_rate - Round the given rate for a clock
@@ -251,5 +296,30 @@ TEE_Result clk_get_duty_cyle(struct clk *clk, struct clk_duty *duty);
 unsigned long clk_round_rate(struct clk *clk, unsigned long rate);
 
 void clk_summary(void);
+
+#ifdef CFG_PM
+/**
+ * clk_save_context - save clock context for poweroff
+ *
+ * Saves the context of the clock register for powerstates in which the
+ * contents of the registers will be lost. Occurs deep within the suspend
+ * code.
+ */
+TEE_Result clk_save_context(void);
+
+/**
+ * clk_restore_context - restore clock context after poweroff
+ *
+ * Restore the saved clock context upon resume.
+ *
+ */
+void clk_restore_context(void);
+
+#else /* CFG_PM */
+
+static inline TEE_Result clk_save_context(void) { return TEE_SUCCESS; };
+static inline void clk_restore_context(void) {};
+
+#endif /* CFG_PM */
 
 #endif /* __DRIVERS_CLK_H */

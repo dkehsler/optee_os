@@ -10,6 +10,7 @@
 #include <drivers/stm32_gpio.h>
 #include <kernel/dt.h>
 #include <kernel/dt_driver.h>
+#include <kernel/mutex_pm_aware.h>
 #include <mm/core_memprot.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -112,7 +113,9 @@ struct i2c_cfg {
  * @saved_timing: Saved timing value if already computed
  * @saved_frequency: Saved frequency value if already computed
  * @sec_cfg: I2C registers configuration storage
- * @pinctrl: Reference to PINCTRLs
+ * @pinctrl_list: Reference to PINCTRLs
+ * @secure_i2c: True if I2C bus is secure, false otherwise
+ * @mu: Protection on concurrent access to the I2C bus considering PM context
  */
 struct i2c_handle_s {
 	struct io_pa_va base;
@@ -126,6 +129,7 @@ struct i2c_handle_s {
 	struct i2c_cfg sec_cfg;
 	struct stm32_pinctrl_list *pinctrl_list;
 	bool secure_i2c;
+	struct mutex_pm_aware mu;
 };
 
 /* STM32 specific defines */
@@ -285,8 +289,8 @@ TEE_Result i2c_dt_get_by_subnode(const void *fdt, int subnode,
  * the devicetree description or NULL if invalid description in which case
  * @res provides the error code.
  */
-typedef struct i2c_handle_s *(*i2c_dt_get_func)
-	(struct dt_driver_phandle_args *a, void *data, TEE_Result *res);
+typedef struct i2c_handle_s *(*i2c_dt_get_func)(struct dt_pargs *a, void *data,
+						TEE_Result *res);
 
 /*
  * i2c_dt_register_provider - Register an i2c provider

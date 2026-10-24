@@ -1577,12 +1577,6 @@ static void clk_stm32_debug_display_pdata(void)
 }
 #endif
 
-static TEE_Result stm32_clk_parse_fdt_mco_pins(const void *fdt, int node,
-					       struct stm32_clk_platdata *pdata)
-{
-	return stm32_pinctrl_dt_get_by_index(fdt, node, 0, &pdata->pinctrl_cfg);
-}
-
 static int fdt_clk_stm32_parse_oscillator(const void *fdt, int node,
 					  const char *name,
 					  struct stm32_osci_dt_cfg *osci)
@@ -1962,13 +1956,20 @@ static TEE_Result clk_stm32_composite_get_duty_cycle(struct clk *clk,
 	return TEE_SUCCESS;
 }
 
-static unsigned long clk_stm32_composite_round_rate(struct clk *clk __unused,
+static unsigned long clk_stm32_composite_round_rate(struct clk *clk,
 						    unsigned long rate,
 						    unsigned long prate)
 {
+	struct clk_stm32_priv *priv = clk_stm32_get_priv();
+	struct clk_stm32_composite_cfg *cfg = clk->priv;
+	const struct div_cfg *divider = &priv->div[cfg->div_id];
 	unsigned int div = 0U;
 
-	div = UDIV_ROUND_NEAREST((uint64_t)prate, rate);
+	if (cfg->div_id == NO_DIV)
+		return 0UL;
+
+	div = MIN(UDIV_ROUND_NEAREST((uint64_t)prate, rate),
+		  MASK_WIDTH_SHIFT(divider->width, 0));
 
 	return UDIV_ROUND_NEAREST((uint64_t)prate, div);
 }
@@ -3343,7 +3344,7 @@ static void __maybe_unused stm32_clock_resume(void)
 	clk_stm32_pm_disable_ker_clocks();
 }
 
-static TEE_Result stm32_clock_pm(enum pm_op op, unsigned int pm_hint __unused,
+static TEE_Result stm32_clock_pm(enum pm_op op, unsigned int pm_hint,
 				 const struct pm_callback_handle *hdl __unused)
 {
 	static int standby_prepared;
@@ -3398,7 +3399,6 @@ static bool clk_stm32_clock_is_critical(struct clk *clk __maybe_unused)
 		&ck_rtcapb,
 		&ck_tzc,
 		&ck_etzpcb,
-		&ck_iwdg1apb,
 		&ck_bsec,
 		&ck_stgen_k,
 		&ck_bkpsram,
@@ -3494,11 +3494,21 @@ static TEE_Result stm32mp13_clk_probe(const void *fdt, int node,
 	int rc = 0;
 	struct clk_stm32_priv *priv = &stm32mp13_clock_data;
 	struct stm32_clk_platdata *pdata = &stm32mp13_clock_pdata;
+	int subnode = 0;
 
 	fdt_rc = fdt_stm32_clk_parse(fdt, node, pdata);
 	if (fdt_rc) {
 		EMSG("Failed to parse clock node: %d", fdt_rc);
 		return TEE_ERROR_GENERIC;
+	}
+
+	fdt_for_each_subnode(subnode, fdt, node) {
+		res = dt_driver_maybe_add_probe_node(fdt, subnode);
+		if (res) {
+			EMSG("Failed on node %s with %#"PRIx32,
+			     fdt_get_name(fdt, subnode, NULL), res);
+			return res;
+		}
 	}
 
 	res = clk_stm32_init(priv, stm32_rcc_base());
@@ -3528,28 +3538,12 @@ static TEE_Result stm32mp13_clk_probe(const void *fdt, int node,
 
 CLK_DT_DECLARE(stm32mp13_clk, "st,stm32mp13-rcc", stm32mp13_clk_probe);
 
-static TEE_Result stm32mp13_rcc_mco_probe(const void *fdt, int node,
-					  const void *compat_data __unused)
-{
-	struct stm32_clk_platdata *pdata = &stm32mp13_clock_pdata;
-
-	return stm32_clk_parse_fdt_mco_pins(fdt, node, pdata);
-}
-
-static const struct dt_device_match stm32mp13_rcc_mco_match_table[] = {
-	{ .compatible = "st,stm32mp13-rcc-mco" },
-	{ }
-};
-
-DEFINE_DT_DRIVER(stm32mp13_rcc_mco_dt_driver) = {
-	.name = "stm32mp13_rcc_mco",
-	.match_table = stm32mp13_rcc_mco_match_table,
-	.probe = stm32mp13_rcc_mco_probe,
-};
-
 void stm32_reset_system(void)
 {
 	vaddr_t rcc = stm32_rcc_base();
+
+	/* Make sure the pending operation are visible */
+	dsb();
 
 	io_write32(rcc + RCC_MP_GRSTCSETR, RCC_MP_GRSTCSETR_MPSYSRST);
 }

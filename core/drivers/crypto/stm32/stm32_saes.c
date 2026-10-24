@@ -13,6 +13,7 @@
 #include <kernel/dt.h>
 #include <kernel/huk_subkey.h>
 #include <kernel/mutex.h>
+#include <kernel/pm.h>
 #include <libfdt.h>
 #include <mm/core_memprot.h>
 #include <stdint.h>
@@ -29,8 +30,6 @@
 #define AES_BLOCK_SIZE			(AES_BLOCK_SIZE_BIT / INT8_BIT)
 #define AES_BLOCK_NB_U32		(AES_BLOCK_SIZE / sizeof(uint32_t))
 
-#define AES_KEYSIZE_128			16U
-#define AES_KEYSIZE_256			32U
 #define AES_IVSIZE			16U
 
 /* SAES control register */
@@ -138,6 +137,7 @@
 
 #define SAES_TIMEOUT_US			100000U
 #define TIMEOUT_US_1MS			1000U
+#define SAES_RESET_DELAY		U(2)
 
 /*
  * Macro to manage bit manipulation when we work on local variable
@@ -1415,7 +1415,11 @@ static TEE_Result stm32_saes_parse_fdt(struct stm32_saes_platdata *pdata,
 	if (res != TEE_SUCCESS && res != TEE_ERROR_ITEM_NOT_FOUND)
 		return res;
 
-	return clk_dt_get_by_index(fdt, node, 0, &pdata->clk);
+	res = clk_dt_get_by_name(fdt, node, "bus", &pdata->clk);
+	if (res)
+		return res;
+
+	return clk_dt_get_by_name(fdt, node, "rng", &pdata->clk_rng);
 }
 
 __weak
@@ -1440,6 +1444,56 @@ TEE_Result stm32_saes_get_platdata(struct stm32_saes_platdata *pdata __unused)
 }
 #endif
 
+static TEE_Result stm32_saes_reset(void)
+{
+	TEE_Result ret = TEE_SUCCESS;
+	vaddr_t base = io_pa_or_va(&saes_pdata.base, 1);
+
+	if (!saes_pdata.reset) {
+		/* Internal reset of SAES */
+		io_setbits32(base + _SAES_CR, _SAES_CR_IPRST);
+		udelay(SAES_RESET_DELAY);
+		io_clrbits32(base + _SAES_CR, _SAES_CR_IPRST);
+		return ret;
+	}
+
+	ret = rstctrl_assert_to(saes_pdata.reset, TIMEOUT_US_1MS);
+	if (ret)
+		return ret;
+
+	udelay(SAES_RESET_DELAY);
+
+	return rstctrl_deassert_to(saes_pdata.reset, TIMEOUT_US_1MS);
+}
+
+static TEE_Result stm32_saes_pm(enum pm_op op, uint32_t pm_hint,
+				const struct pm_callback_handle *hdl __unused)
+{
+	TEE_Result ret = TEE_ERROR_NOT_IMPLEMENTED;
+
+	switch (op) {
+	case PM_OP_SUSPEND:
+		clk_disable(saes_pdata.clk);
+		clk_disable(saes_pdata.clk_rng);
+		ret = TEE_SUCCESS;
+		break;
+	case PM_OP_RESUME:
+		if (clk_enable(saes_pdata.clk) ||  clk_enable(saes_pdata.clk_rng))
+			panic();
+
+		if (PM_HINT_IS_STATE(pm_hint, CONTEXT)) {
+			ret = stm32_saes_reset();
+			if (ret)
+				panic();
+		}
+		ret = TEE_SUCCESS;
+		break;
+	default:
+		break;
+	}
+	return ret;
+}
+
 /**
  * @brief Initialize SAES driver.
  * @param None.
@@ -1449,7 +1503,6 @@ static TEE_Result stm32_saes_probe(const void *fdt, int node,
 				   const void *compat_data __unused)
 {
 	TEE_Result res = TEE_SUCCESS;
-	vaddr_t base = 0;
 
 	if (stm32_saes_get_platdata(&saes_pdata))
 		return TEE_ERROR_NOT_SUPPORTED;
@@ -1458,19 +1511,11 @@ static TEE_Result stm32_saes_probe(const void *fdt, int node,
 	if (res)
 		return res;
 
-	clk_enable(saes_pdata.clk);
-
-	if (saes_pdata.reset &&
-	    rstctrl_assert_to(saes_pdata.reset, TIMEOUT_US_1MS) != 0)
+	if (clk_enable(saes_pdata.clk) || clk_enable(saes_pdata.clk_rng))
 		panic();
 
-	if (saes_pdata.reset &&
-	    rstctrl_deassert_to(saes_pdata.reset, TIMEOUT_US_1MS) != 0)
+	if (stm32_saes_reset())
 		panic();
-
-	base = io_pa_or_va(&saes_pdata.base, 1);
-	io_write32(base + _SAES_CR, 0XFFFFFFFF);
-	io_write32(base + _SAES_CR, 0X0);
 
 	if (IS_ENABLED(CFG_CRYPTO_DRV_CIPHER)) {
 		res = stm32_register_cipher(SAES_IP);
@@ -1479,6 +1524,9 @@ static TEE_Result stm32_saes_probe(const void *fdt, int node,
 			panic();
 		}
 	}
+
+	if (IS_ENABLED(CFG_PM))
+		register_pm_core_service_cb(stm32_saes_pm, NULL, "stm32-saes");
 
 	return res;
 }
@@ -1492,6 +1540,6 @@ static const struct dt_device_match saes_match_table[] = {
 DEFINE_DT_DRIVER(stm32_saes_dt_driver) = {
 	.name = "stm32-saes",
 	.match_table = saes_match_table,
-	.probe = &stm32_saes_probe,
+	.probe = stm32_saes_probe,
 };
 #endif

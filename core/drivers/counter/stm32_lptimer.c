@@ -37,6 +37,7 @@
 #define _LPTIM_IXX_ARROK	BIT(4)
 #define _LPTIM_IXX_UP		BIT(5)
 #define _LPTIM_IXX_DOWN		BIT(6)
+#define _LPTIM_CMPARR_OK	(_LPTIM_IXX_CMPOK | _LPTIM_IXX_ARROK)
 
 /* LPTIM_CFGR register fields */
 #define _LPTIM_CFGR_CKSEL		BIT(0)
@@ -112,6 +113,12 @@
 #define LPTIM_ERR_INVAL		22	/* Invalid argument */
 #define LPTIM_ERR_NOTSUP	45	/* Operation not supported */
 
+#define TIMEOUT_US_100MS	U(100000)
+
+struct lptimer_compat_data {
+	bool ier_wr_disabled;		/* disable lptimer to set dier */
+};
+
 struct lptimer_device {
 	const void *fdt;
 	int node;
@@ -119,6 +126,7 @@ struct lptimer_device {
 	struct lptimer_driver_data *ddata;
 	struct counter_device *counter_dev;
 	struct itr_handler *itr;
+	const struct lptimer_compat_data *cdata;
 };
 
 struct stm32_lptimer_config {
@@ -130,7 +138,17 @@ static TEE_Result stm32_lpt_counter_set_alarm(struct counter_device *counter)
 {
 	struct lptimer_device *lpt_dev = counter_priv(counter);
 	uintptr_t base = lpt_dev->pdata.base;
+	TEE_Result res = TEE_ERROR_GENERIC;
 	uint32_t cr = 0;
+	uint32_t val = 0;
+
+	/* ARR must be strictly greater than the CMP, within max_ticks range */
+	if (counter->alarm.ticks >= counter->max_ticks)
+		return TEE_ERROR_GENERIC;
+
+	res = clk_enable(lpt_dev->pdata.clock);
+	if (res)
+		return res;
 
 	cr = io_read32(base + _LPTIM_CR);
 	/*
@@ -138,14 +156,27 @@ static TEE_Result stm32_lpt_counter_set_alarm(struct counter_device *counter)
 	 * when the LPTIM is enabled
 	 */
 	io_setbits32(base + _LPTIM_CR, _LPTIM_CR_ENABLE);
+	io_write32(base + _LPTIM_ARR, counter->alarm.ticks + 1);
 	io_write32(base + _LPTIM_CMP, counter->alarm.ticks);
-	io_write32(base + _LPTIM_ARR, counter->alarm.ticks);
 
-	/*
-	 * LPTIM_IER register must only be modified
-	 * when the LPTIM is disabled
-	 */
-	io_clrbits32(base + _LPTIM_CR, _LPTIM_CR_ENABLE);
+	/* Enforce CMP and ARR are correctly set, then clear these flags */
+	if (IO_READ32_POLL_TIMEOUT(base + _LPTIM_ISR, val,
+				   (val & _LPTIM_CMPARR_OK) == _LPTIM_CMPARR_OK,
+				   0, TIMEOUT_US_100MS)) {
+		io_write32(base + _LPTIM_CR, cr);
+		clk_disable(lpt_dev->pdata.clock);
+		return TEE_ERROR_GENERIC;
+	}
+	io_write32(base + _LPTIM_ICR, _LPTIM_CMPARR_OK);
+
+	if (lpt_dev->cdata && lpt_dev->cdata->ier_wr_disabled) {
+		/*
+		 * LPTIM_IER register must only be modified
+		 * when the LPTIM is disabled
+		 */
+		io_clrbits32(base + _LPTIM_CR, _LPTIM_CR_ENABLE);
+	}
+
 	/* enable, Compare match Interrupt */
 	io_setbits32(base + _LPTIM_IER, _LPTIM_IXX_CMPM);
 
@@ -153,6 +184,13 @@ static TEE_Result stm32_lpt_counter_set_alarm(struct counter_device *counter)
 	io_write32(base + _LPTIM_CR, cr);
 
 	counter->alarm.is_enabled = true;
+
+	/* restart timer if it was enabled before setting the alarm */
+	if (cr & _LPTIM_CR_ENABLE)
+		io_write32(base + _LPTIM_CR,
+			   _LPTIM_CR_ENABLE | _LPTIM_CR_CNTSTRT);
+
+	clk_disable(lpt_dev->pdata.clock);
 
 	return TEE_SUCCESS;
 }
@@ -165,12 +203,14 @@ static TEE_Result stm32_lpt_counter_cancel_alarm(struct counter_device *counter)
 
 	cr = io_read32(base + _LPTIM_CR);
 
-	/*
-	 * LPTIM_IER register must only be modified
-	 * when the LPTIM is disabled
-	 */
-	io_clrbits32(base + _LPTIM_CR, _LPTIM_CR_ENABLE);
-	io_clrbits32(base + _LPTIM_IER, _LPTIM_CR_ENABLE);
+	if (lpt_dev->cdata && lpt_dev->cdata->ier_wr_disabled) {
+		/*
+		 * LPTIM_IER register must only be modified
+		 * when the LPTIM is disabled
+		 */
+		io_clrbits32(base + _LPTIM_CR, _LPTIM_CR_ENABLE);
+	}
+	io_clrbits32(base + _LPTIM_IER, _LPTIM_IXX_CMPM);
 
 	/*
 	 * LPTIM_CMP & ARR registers must only be modified
@@ -178,7 +218,6 @@ static TEE_Result stm32_lpt_counter_cancel_alarm(struct counter_device *counter)
 	 */
 	io_setbits32(base + _LPTIM_CR, _LPTIM_CR_ENABLE);
 	io_write32(base + _LPTIM_CMP, 0);
-	io_write32(base + _LPTIM_ARR, 0);
 
 	/* restore cr */
 	io_write32(base + _LPTIM_CR, cr);
@@ -188,8 +227,10 @@ static TEE_Result stm32_lpt_counter_cancel_alarm(struct counter_device *counter)
 	return TEE_SUCCESS;
 }
 
-static int _stm32_lpt_counter_get_value(struct lptimer_device *lpt_dev)
+static TEE_Result _stm32_lpt_counter_get_value(struct lptimer_device *lpt_dev,
+					       uint32_t *ticks)
 {
+	uint64_t timeout = timeout_init_us(TIMEOUT_US_100MS);
 	uintptr_t base = lpt_dev->pdata.base;
 	uint32_t cnt = 0;
 	uint32_t cnt_prev = 0;
@@ -202,21 +243,33 @@ static int _stm32_lpt_counter_get_value(struct lptimer_device *lpt_dev)
 	do {
 		cnt_prev = cnt;
 		cnt = io_read32(base + _LPTIM_CNT);
+		if (timeout_elapsed(timeout))
+			return TEE_ERROR_GENERIC;
 	} while (cnt_prev != cnt);
 
-	return cnt;
+	*ticks = cnt;
+
+	return TEE_SUCCESS;
 }
 
 static TEE_Result stm32_lpt_counter_get_value(struct counter_device *counter,
 					      uint32_t *ticks)
 {
 	struct lptimer_device *lpt_dev = counter_priv(counter);
+	TEE_Result res = TEE_ERROR_GENERIC;
 
 	if (!ticks)
 		return TEE_ERROR_BAD_PARAMETERS;
 
-	*ticks = _stm32_lpt_counter_get_value(lpt_dev);
-	return TEE_SUCCESS;
+	res = clk_enable(lpt_dev->pdata.clock);
+	if (res)
+		return res;
+
+	res = _stm32_lpt_counter_get_value(lpt_dev, ticks);
+
+	clk_disable(lpt_dev->pdata.clock);
+
+	return res;
 }
 
 static TEE_Result stm32_lpt_counter_stop(struct counter_device *counter)
@@ -226,7 +279,6 @@ static TEE_Result stm32_lpt_counter_stop(struct counter_device *counter)
 
 	io_write32(base + _LPTIM_CR, 0);
 	io_write32(base + _LPTIM_CMP, 0);
-	io_write32(base + _LPTIM_ARR, 0);
 
 	clk_disable(lpt_dev->pdata.clock);
 
@@ -240,30 +292,32 @@ static TEE_Result stm32_lpt_counter_start(struct counter_device *counter,
 	struct stm32_lptimer_platdata *pdata = &lpt_dev->pdata;
 	struct stm32_lptimer_config *conf =
 		(struct stm32_lptimer_config *)config;
-	struct lptimer_ext_input_cfg *ext_input = &conf->ext_input;
-	struct lptimer_ext_trigger_cfg *ext_trigger = &conf->ext_trigger;
 	uintptr_t base = pdata->base;
+	TEE_Result res = TEE_ERROR_GENERIC;
 	uint32_t cfgr = 0;
 	uint32_t cfgr2 = 0;
 
-	if (ext_input->num) {
+	if (conf && conf->ext_input.num) {
 		cfgr += _LPTIM_CFGR_COUNTMODE;
 
 		cfgr2 += _LPTIM_FLD_PREP(_LPTIM_CFGR2_IN1SEL,
-					 ext_input->mux[0]);
-		if (ext_input->num == 2)
+					 conf->ext_input.mux[0]);
+		if (conf->ext_input.num == 2)
 			cfgr2 += _LPTIM_FLD_PREP(_LPTIM_CFGR2_IN2SEL,
-						 ext_input->mux[1]);
+						 conf->ext_input.mux[1]);
 	}
 
-	if (ext_trigger->num) {
-		cfgr += _LPTIM_FLD_PREP(_LPTIM_CFGR_TRIGSEL, ext_trigger->mux);
+	if (conf && conf->ext_trigger.num) {
+		cfgr += _LPTIM_FLD_PREP(_LPTIM_CFGR_TRIGSEL,
+					conf->ext_trigger.mux);
 		cfgr += _LPTIM_FLD_PREP(_LPTIM_CFGR_TRIGEN,
-					ext_trigger->polarity);
+					conf->ext_trigger.polarity);
 		cfgr |= _LPTIM_CFGR_TIMOUT;
 	}
 
-	clk_enable(lpt_dev->pdata.clock);
+	res = clk_enable(lpt_dev->pdata.clock);
+	if (res)
+		return res;
 
 	/*
 	 * LPTIM CFGR2 & IER registers must only be modified
@@ -335,7 +389,7 @@ stm32_lptimer_counter_set_config(struct counter_device *counter,
 
 	/* external-input = < polarity mux1 mux2 > */
 	ext_input = &conf->ext_input;
-	ext_input->num = len - 4;
+	ext_input->num = len - 3;
 	ext_input->polarity = get_param(param, 2);
 	ext_input->mux[0] = get_param(param, 3);
 
@@ -380,27 +434,39 @@ static enum itr_return stm32_lptimer_itr(struct itr_handler *h)
 	uintptr_t base = lpt_dev->pdata.base;
 	uint32_t isr = 0;
 
+	/* counter may get stopped from the callback, keep the clock */
+	if (clk_enable(lpt_dev->pdata.clock))
+		panic();
+
 	isr = io_read32(base + _LPTIM_ISR);
 
 	if (isr & _LPTIM_IXX_CMPM) {
-		uint32_t ticks = _stm32_lpt_counter_get_value(lpt_dev);
+		uint32_t ticks = 0;
 		void *priv = lpt_dev->counter_dev->alarm.priv;
+
+		if (_stm32_lpt_counter_get_value(lpt_dev, &ticks))
+			EMSG("Failed to get counter value");
 
 		lpt_dev->counter_dev->alarm.callback(ticks, priv);
 	}
 
 	io_write32(base + _LPTIM_ICR, isr);
 
+	clk_disable(lpt_dev->pdata.clock);
+
 	return ITRR_HANDLED;
 }
 
-static void stm32_lptimer_set_driverdata(struct lptimer_device *lpt_dev)
+static TEE_Result stm32_lptimer_set_driverdata(struct lptimer_device *lpt_dev)
 {
 	struct lptimer_driver_data *ddata = lpt_dev->ddata;
 	uintptr_t base = lpt_dev->pdata.base;
+	TEE_Result res = TEE_ERROR_GENERIC;
 	uint32_t regval = 0;
 
-	clk_enable(lpt_dev->pdata.clock);
+	res = clk_enable(lpt_dev->pdata.clock);
+	if (res)
+		return res;
 
 	regval = io_read32(base + _LPTIM_HWCFGR);
 	ddata->nb_ext_input = _LPTIM_FLD_GET(_LPTIM_HWCFGR_CFG1, regval);
@@ -418,10 +484,15 @@ static void stm32_lptimer_set_driverdata(struct lptimer_device *lpt_dev)
 	     ddata->encoder ? "true" : "false");
 
 	clk_disable(lpt_dev->pdata.clock);
+
+	return TEE_SUCCESS;
 }
 
 #ifdef CFG_EMBED_DTB
-#define LPTIMER_COUNTER_COMPAT	"st,stm32-lptimer-counter"
+static const char * const stm32_lptimer_counter_compat[] = {
+	"st,stm32-lptimer-counter",
+	"st,stm32mp25-lptimer-counter",
+};
 
 struct dt_id_attr {
 	/* The effective size of the array is meaningless here */
@@ -432,10 +503,11 @@ static TEE_Result stm32_lptimer_parse_fdt(struct lptimer_device *lpt_dev)
 {
 	struct stm32_lptimer_platdata *pdata = &lpt_dev->pdata;
 	struct dt_node_info dt_info = { };
-	static struct io_pa_va base;
+	struct io_pa_va base = { };
 	const void *fdt = lpt_dev->fdt;
 	int node = lpt_dev->node;
 	TEE_Result res = TEE_ERROR_GENERIC;
+	unsigned int i = 0;
 	int len = 0;
 
 	assert(lpt_dev && lpt_dev->fdt);
@@ -457,13 +529,21 @@ static TEE_Result stm32_lptimer_parse_fdt(struct lptimer_device *lpt_dev)
 	if (res)
 		return res;
 
-	stm32_lptimer_set_driverdata(lpt_dev);
+	res = stm32_lptimer_set_driverdata(lpt_dev);
+	if (res)
+		return res;
 
 	node = fdt_subnode_offset(fdt, node, "counter");
-	if (node >= 0 &&
-	    !fdt_node_check_compatible(fdt, node, LPTIMER_COUNTER_COMPAT) &&
-	    _fdt_get_status(fdt, node) != DT_STATUS_DISABLED)
-		pdata->mode = LPTIMER_MODE_COUNTER;
+	if (node >= 0 && _fdt_get_status(fdt, node) != DT_STATUS_DISABLED) {
+		for (i = 0; i < ARRAY_SIZE(stm32_lptimer_counter_compat); i++) {
+			const char *compat = stm32_lptimer_counter_compat[i];
+
+			if (!fdt_node_check_compatible(fdt, node, compat)) {
+				pdata->mode = LPTIMER_MODE_COUNTER;
+				break;
+			}
+		}
+	}
 
 	return 0;
 }
@@ -542,6 +622,8 @@ static TEE_Result probe_lpt_device(struct lptimer_device *lpt_dev)
 	if (!lpt_dev->itr)
 		return TEE_ERROR_OUT_OF_MEMORY;
 
+	itr_enable(lpt_dev->itr->it);
+
 	if (lpt_dev->pdata.mode & LPTIMER_MODE_COUNTER) {
 		lpt_dev->counter_dev = counter_dev_alloc();
 		lpt_dev->counter_dev->ops = &stm32_lpt_counter_ops;
@@ -566,11 +648,10 @@ static TEE_Result stm32_lptimer_probe(const void *fdt, int node,
 	if (!lpt_dev)
 		return TEE_ERROR_OUT_OF_MEMORY;
 
-	if (lpt_dev) {
-		lpt_dev->fdt = fdt;
-		lpt_dev->node = node;
-		res = probe_lpt_device(lpt_dev);
-	}
+	lpt_dev->fdt = fdt;
+	lpt_dev->node = node;
+	lpt_dev->cdata = compat_data;
+	res = probe_lpt_device(lpt_dev);
 
 	if (res)
 		stm32_lptimer_free(lpt_dev);
@@ -578,8 +659,23 @@ static TEE_Result stm32_lptimer_probe(const void *fdt, int node,
 	return res;
 }
 
+static const struct lptimer_compat_data lptimer_cdata = {
+	.ier_wr_disabled = true,
+};
+
+static const struct lptimer_compat_data lptimer_mp25_cdata = {
+	.ier_wr_disabled = false,
+};
+
 static const struct dt_device_match stm32_lptimer_match_table[] = {
-	{ .compatible = "st,stm32-lptimer" },
+	{
+		.compatible = "st,stm32-lptimer",
+		.compat_data = &lptimer_cdata,
+	},
+	{
+		.compatible = "st,stm32mp25-lptimer",
+		.compat_data = &lptimer_mp25_cdata,
+	},
 	{ }
 };
 

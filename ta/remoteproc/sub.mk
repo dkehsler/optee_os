@@ -1,3 +1,3 @@
 global-incdirs-y += include
-srcs-y += remoteproc_core.c
-srcs-y += elf_parser.c
+global-incdirs-y += src
+subdirs-y += src

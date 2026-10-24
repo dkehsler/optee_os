@@ -171,6 +171,11 @@ bool stm32_bsec_can_access_otp(uint32_t otp_id);
 bool stm32_bsec_nsec_can_access_otp(uint32_t otp_id);
 
 /*
+ * Return true if host-self debug is enabled.
+ */
+bool stm32_bsec_self_hosted_debug_is_enabled(void);
+
+/*
  * Find and get OTP location from its name.
  * @name: sub-node name to look up.
  * @otp_id: pointer to read OTP number or NULL.
@@ -203,7 +208,6 @@ TEE_Result stm32_bsec_find_otp_by_phandle(const uint32_t phandle,
  *             00b: Sec Open
  *             01b: Sec Closed
  *             11b: Invalid
- *           [8]: Hardware Key set = 1b
  * Return a TEE_Result compliant status
  */
 TEE_Result stm32_bsec_get_state(uint32_t *state);
@@ -211,7 +215,6 @@ TEE_Result stm32_bsec_get_state(uint32_t *state);
 #define BSEC_STATE_SEC_OPEN	U(0x0)
 #define BSEC_STATE_SEC_CLOSED	U(0x1)
 #define BSEC_STATE_INVALID	U(0x3)
-
-#define BSEC_HARDWARE_KEY	BIT(8)
+#define BSEC_STATE_MASK		GENMASK_32(1, 0)
 
 #endif /*__STM32_BSEC_H*/

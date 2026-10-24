@@ -300,10 +300,10 @@ static bool plat_can_suspend(void)
 	uint32_t exceptions = 0;
 	bool rc = true;
 
-#ifndef CFG_STM32MP13
-	if (!IS_ENABLED(CFG_STM32_RNG))
+	/* STM32MP15 in SYSRAM requires STM32 RNG in order to suspend */
+	if (IS_ENABLED(CFG_STM32MP15) && !IS_ENABLED(CFG_STM32_RNG) &&
+	    IS_ENABLED(CFG_STM32MP1_OPTEE_IN_SYSRAM))
 		return false;
-#endif
 
 	if (CFG_TEE_CORE_NB_CORE == 1)
 		return true;
@@ -439,12 +439,7 @@ void __noreturn psci_system_off(void)
 /* Override default psci_system_reset() with platform specific sequence */
 void __noreturn psci_system_reset(void)
 {
-	IMSG("Forced system reset");
-	console_flush();
-	mdelay(10);
-	stm32_reset_system();
-	udelay(100);
-	panic();
+	do_reset("PSCI");
 }
 
 /* Override default psci_cpu_on() with platform supported features */

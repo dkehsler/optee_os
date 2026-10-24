@@ -21,16 +21,6 @@
 
 static SLIST_HEAD(, rdev) regulator_device_list = SLIST_HEAD_INITIALIZER(rdev);
 
-const char __weak *plat_get_lp_mode_name(int mode __unused)
-{
-	return NULL;
-}
-
-int __weak plat_get_lp_mode_count(void)
-{
-	return 0;
-}
-
 static void lock_driver(const struct rdev *rdev)
 {
 	if (rdev->desc->ops->lock)
@@ -293,16 +283,23 @@ bool regulator_is_enabled(const struct rdev *rdev)
 TEE_Result regulator_set_voltage(struct rdev *rdev, uint16_t mvolt)
 {
 	TEE_Result res = TEE_ERROR_GENERIC;
+	uint16_t cur_mv = 0;
 
 	assert(rdev);
 
 	FMSG("%s %"PRIu16"mV", rdev->desc->node_name, mvolt);
 
-	if (!rdev->desc->ops->set_voltage)
-		return TEE_ERROR_NOT_IMPLEMENTED;
-
 	if (mvolt < rdev->min_mv || mvolt > rdev->max_mv)
 		return TEE_ERROR_BAD_PARAMETERS;
+
+	res = regulator_get_voltage(rdev, &cur_mv);
+	if (res)
+		return res;
+	if (cur_mv == mvolt)
+		return TEE_SUCCESS;
+
+	if (!rdev->desc->ops->set_voltage)
+		return TEE_ERROR_NOT_IMPLEMENTED;
 
 	lock_driver(rdev);
 	res = rdev->desc->ops->set_voltage(rdev->desc, mvolt);
@@ -317,18 +314,16 @@ TEE_Result regulator_set_voltage(struct rdev *rdev, uint16_t mvolt)
 	if (rdev->ramp_delay_uv_per_us > 0) {
 		unsigned int d = 0;
 
-		if (rdev->cur_mv > mvolt)
-			d = rdev->cur_mv - mvolt;
+		if (cur_mv > mvolt)
+			d = cur_mv - mvolt;
 		else
-			d = mvolt - rdev->cur_mv;
+			d = mvolt - cur_mv;
 
 		d = (d * 1000) / rdev->ramp_delay_uv_per_us;
 
 		FMSG("%s %"PRIu32"uS", rdev->desc->node_name, d);
 		udelay(d);
 	}
-
-	rdev->cur_mv = mvolt;
 
 	return res;
 }
@@ -527,18 +522,6 @@ static struct regul_property flag_prop[] = {
 		.name = "regulator-pull-down",
 		.flag = REGUL_PULL_DOWN,
 	},
-	{
-		.name = "st,mask-reset",
-		.flag = REGUL_MASK_RESET,
-	},
-	{
-		.name = "st,regulator-sink-source",
-		.flag = REGUL_SINK_SOURCE,
-	},
-	{
-		.name = "st,regulator-bypass",
-		.flag = REGUL_ENABLE_BYPASS,
-	},
 };
 
 static TEE_Result parse_properties(const void *fdt, struct rdev *rdev, int node)
@@ -592,53 +575,6 @@ static void parse_supply(const void *fdt, struct rdev *rdev, int node)
 	if (rdev->supply_phandle < 0) {
 		node = fdt_parent_offset(fdt, node);
 		rdev->supply_phandle = get_supply_phandle(fdt, node, name);
-	}
-}
-
-static void parse_low_power_mode(const void *fdt, struct rdev *rdev, int node,
-				 int mode)
-{
-	const fdt32_t *cuint = NULL;
-
-	rdev->lp_state[mode] = 0;
-
-	if (fdt_getprop(fdt, node, "regulator-off-in-suspend", NULL)) {
-		FMSG("%s: mode:%d OFF", rdev->desc->node_name, mode);
-		rdev->lp_state[mode] |= LP_STATE_OFF;
-	} else if (fdt_getprop(fdt, node, "regulator-on-in-suspend", NULL)) {
-		FMSG("%s: mode:%d ON", rdev->desc->node_name, mode);
-		rdev->lp_state[mode] |= LP_STATE_ON;
-	} else {
-		rdev->lp_state[mode] |= LP_STATE_UNCHANGED;
-	}
-
-	cuint = fdt_getprop(fdt, node, "regulator-suspend-microvolt", NULL);
-	if (cuint) {
-		uint16_t mv = (uint16_t)(fdt32_to_cpu(*cuint) / 1000U);
-
-		FMSG("%s: mode:%d suspend mv=%"PRIu16, rdev->desc->node_name,
-		     mode, mv);
-
-		rdev->lp_state[mode] |= LP_STATE_SET_VOLT;
-		rdev->lp_mv[mode] = mv;
-	}
-}
-
-static void parse_low_power_modes(const void *fdt, struct rdev *rdev, int node)
-{
-	int mode_count = plat_get_lp_mode_count();
-	int mode = 0;
-
-	for (mode = 0; mode < mode_count; mode++) {
-		const char *lp_mode_name = plat_get_lp_mode_name(mode);
-		int n = 0;
-
-		if (lp_mode_name) {
-			/* Get the configs from regulator_state_node subnode */
-			n = fdt_subnode_offset(fdt, node, lp_mode_name);
-			if (n >= 0)
-				parse_low_power_mode(fdt, rdev, n, mode);
-		}
 	}
 }
 
@@ -709,8 +645,6 @@ static TEE_Result parse_dt(struct rdev *rdev, int node)
 
 	parse_supply(fdt, rdev, node);
 
-	parse_low_power_modes(fdt, rdev, node);
-
 	return TEE_SUCCESS;
 }
 #else /* CFG_EMBED_DTB */
@@ -731,7 +665,6 @@ TEE_Result regulator_register(const struct regul_desc *desc, int node)
 {
 	TEE_Result res = TEE_ERROR_OUT_OF_MEMORY;
 	struct rdev *rdev = NULL;
-	size_t lp_mode_count = plat_get_lp_mode_count();
 	uint16_t mv = 0;
 
 	assert(desc);
@@ -741,16 +674,6 @@ TEE_Result regulator_register(const struct regul_desc *desc, int node)
 	rdev = calloc(1, sizeof(*rdev));
 	if (!rdev)
 		return TEE_ERROR_OUT_OF_MEMORY;
-
-	if (lp_mode_count) {
-		rdev->lp_state = calloc(lp_mode_count, sizeof(*rdev->lp_state));
-		rdev->lp_mv = calloc(lp_mode_count, sizeof(*rdev->lp_mv));
-
-		if (!rdev->lp_state || !rdev->lp_mv) {
-			res = TEE_ERROR_OUT_OF_MEMORY;
-			goto out;
-		}
-	}
 
 	rdev->ramp_delay_uv_per_us = desc->ramp_delay_uv_per_us;
 	rdev->enable_ramp_delay_us = desc->enable_ramp_delay_us;
@@ -785,8 +708,6 @@ TEE_Result regulator_register(const struct regul_desc *desc, int node)
 		goto out;
 
 	if (regulator_get_voltage(rdev, &mv) == TEE_SUCCESS) {
-		rdev->cur_mv = mv;
-
 		if (mv < rdev->min_mv || mv > rdev->max_mv) {
 			FMSG("Update regulator %s to %"PRIu16"mV",
 			     desc->node_name, rdev->min_mv);
@@ -800,11 +721,8 @@ TEE_Result regulator_register(const struct regul_desc *desc, int node)
 	SLIST_INSERT_HEAD(&regulator_device_list, rdev, link);
 
 out:
-	if (res) {
-		free(rdev->lp_state);
-		free(rdev->lp_mv);
+	if (res)
 		free(rdev);
-	}
 
 	return res;
 }
@@ -818,23 +736,10 @@ out:
  * @rdev - regulator device
  * @pm_hint - Power level hint provided by PM framework
  */
-static TEE_Result suspend_regulator(struct rdev *rdev, unsigned int pm_hint)
+static TEE_Result suspend_regulator(struct rdev *rdev,
+				    unsigned int pm_hint __unused)
 {
 	TEE_Result res = TEE_SUCCESS;
-	int mode = pm_hint;
-
-	if (rdev->desc->ops->suspend) {
-		lock_driver(rdev);
-		res = rdev->desc->ops->suspend(rdev->desc, rdev->lp_state[mode],
-					       rdev->lp_mv[mode]);
-		unlock_driver(rdev);
-
-		if (res) {
-			EMSG("%s suspend failed with %#"PRIx32,
-			     rdev->desc->node_name, res);
-			return res;
-		}
-	}
 
 	/* Ensure boot-on regulators are enabled when resuming */
 	if (rdev->flags & REGUL_BOOT_ON)
@@ -872,7 +777,6 @@ static TEE_Result regulator_pm(enum pm_op op, unsigned int pm_hint,
 
 	if (op == PM_OP_SUSPEND) {
 		FMSG("Regulator core suspend");
-		assert(pm_hint < (unsigned int)plat_get_lp_mode_count());
 
 		SLIST_FOREACH(rdev, &regulator_device_list, link)
 			if (suspend_regulator(rdev, pm_hint))

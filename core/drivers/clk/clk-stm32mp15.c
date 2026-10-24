@@ -1924,8 +1924,12 @@ DECLARE_KEEP_PAGER(clk_op_compute_rate);
 
 static TEE_Result clk_op_enable(struct clk *clk)
 {
-	if (clk_is_gate(clk))
+	if (clk_is_gate(clk)) {
 		__clk_enable(clk_to_gate_ref(clk));
+
+		/* Make sure the clock is enabled before returning to caller */
+		dsb();
+	}
 
 	return TEE_SUCCESS;
 }
@@ -1933,8 +1937,12 @@ DECLARE_KEEP_PAGER(clk_op_enable);
 
 static void clk_op_disable(struct clk *clk)
 {
-	if (clk_is_gate(clk))
+	if (clk_is_gate(clk)) {
+		/* Make sure the previous operations are visible */
+		dsb();
+
 		__clk_disable(clk_to_gate_ref(clk));
+	}
 }
 DECLARE_KEEP_PAGER(clk_op_disable);
 
@@ -1965,7 +1973,7 @@ static TEE_Result register_stm32mp1_clocks(void)
 }
 
 #ifdef CFG_DRIVERS_CLK_DT
-static struct clk *stm32mp1_clk_dt_get_clk(struct dt_driver_phandle_args *pargs,
+static struct clk *stm32mp1_clk_dt_get_clk(struct dt_pargs *pargs,
 					   void *data __unused, TEE_Result *res)
 {
 	unsigned long clock_id = pargs->args[0];
@@ -2158,9 +2166,13 @@ static const struct gate_cfg gates_mp15[GATE_NB] = {
 	GATE_CFG(GATE_APB4DIVRDY,	RCC_APB4DIVR,		31,	0),
 	GATE_CFG(GATE_APB5DIVRDY,	RCC_APB5DIVR,		31,	0),
 	GATE_CFG(GATE_PLL1,		RCC_PLL1CR,		0,	0),
+	GATE_CFG(GATE_PLL1_RDY,		RCC_PLL1CR,		1,	0),
 	GATE_CFG(GATE_PLL2,		RCC_PLL2CR,		0,	0),
+	GATE_CFG(GATE_PLL2_RDY,		RCC_PLL2CR,		1,	0),
 	GATE_CFG(GATE_PLL3,		RCC_PLL3CR,		0,	0),
+	GATE_CFG(GATE_PLL3_RDY,		RCC_PLL3CR,		1,	0),
 	GATE_CFG(GATE_PLL4,		RCC_PLL4CR,		0,	0),
+	GATE_CFG(GATE_PLL4_RDY,		RCC_PLL4CR,		1,	0),
 	GATE_CFG(GATE_MCO1,		RCC_MCO1CFGR,		12,	0),
 	GATE_CFG(GATE_MCO2,		RCC_MCO2CFGR,		12,	0),
 };
@@ -3375,28 +3387,6 @@ static int clk_stm32_pll_init_switch_to_hsi_clk_system(int mux_sys)
 	return sel;
 }
 
-static uint32_t
-clk_stm32_pll_backup_output_diven(const struct stm32_clk_pll *pll)
-{
-	struct clk_stm32_priv *priv = clk_stm32_get_priv();
-	uintptr_t addr = priv->base + pll->reg_pllxcr;
-
-	return io_read32(addr + RCC_OFFSET_PLLXCR) &
-			 (RCC_PLLNCR_DIVPEN | RCC_PLLNCR_DIVQEN |
-			  RCC_PLLNCR_DIVREN);
-}
-
-static void clk_stm32_pll_restore_output_diven(const struct stm32_clk_pll *pll,
-					       uint32_t value)
-{
-	struct clk_stm32_priv *priv = clk_stm32_get_priv();
-	uintptr_t addr = priv->base + pll->reg_pllxcr;
-	const uint32_t mask = RCC_PLLNCR_DIVPEN | RCC_PLLNCR_DIVQEN |
-			      RCC_PLLNCR_DIVREN;
-
-	io_clrsetbits32(addr, mask, value & mask);
-}
-
 static int clk_stm32_pll_init(struct clk_stm32_priv *priv, int pll_idx,
 			      struct stm32_pll_dt_cfg *pll_conf)
 {
@@ -3404,7 +3394,6 @@ static int clk_stm32_pll_init(struct clk_stm32_priv *priv, int pll_idx,
 	int config_on_the_fly = -1;
 	int ret = 0;
 	uint8_t sel = 0;
-	uint32_t save_div_pqr_en = 0;
 	int mux_system[] = { MUX_MPU, MUX_AXI, MUX_MCU, -1 };
 	int mux_sys  = mux_system[pll_idx];
 
@@ -3412,9 +3401,6 @@ static int clk_stm32_pll_init(struct clk_stm32_priv *priv, int pll_idx,
 						 &config_on_the_fly);
 	if (ret != 0)
 		return ret;
-
-	/* Backup status of DIV DIVPEN / DIVQEN / DIVREN */
-	save_div_pqr_en = clk_stm32_pll_backup_output_diven(pll);
 
 	if (config_on_the_fly == -1) {
 		/* Make a backup to the current parent and switch to HSI */
@@ -3447,7 +3433,9 @@ static int clk_stm32_pll_init(struct clk_stm32_priv *priv, int pll_idx,
 		if (stm32_gate_rdy_enable(pll->gate_id))
 			return -1;
 
-		clk_stm32_pll_restore_output_diven(pll, save_div_pqr_en);
+		io_setbits32(priv->base + pll->reg_pllxcr, RCC_PLLNCR_DIVPEN |
+						   RCC_PLLNCR_DIVQEN |
+						   RCC_PLLNCR_DIVREN);
 	}
 
 	if ((config_on_the_fly == -1) && (mux_sys != -1)) {
@@ -3562,6 +3550,7 @@ static TEE_Result stm32mp1_clock_provider_probe(const void *fdt, int offs,
 	struct clk_stm32_priv *priv = &stm32mp15_clock_data;
 	struct stm32_clk_platdata *pdata = &stm32mp15_clock_pdata;
 	int rc = 0;
+	int subnode = 0;
 
 	if (compat_data == &non_secure_rcc)
 		disable_rcc_tzen();
@@ -3572,6 +3561,15 @@ static TEE_Result stm32mp1_clock_provider_probe(const void *fdt, int offs,
 	if (rc) {
 		EMSG("Failed to parse clock node: %d", rc);
 		return TEE_ERROR_GENERIC;
+	}
+
+	fdt_for_each_subnode(subnode, fdt, offs) {
+		res = dt_driver_maybe_add_probe_node(fdt, subnode);
+		if (res) {
+			EMSG("Failed on node %s with %#"PRIx32,
+			     fdt_get_name(fdt, subnode, NULL), res);
+			return res;
+		}
 	}
 
 	res = clk_stm32_init(priv, stm32_rcc_base());
@@ -3624,8 +3622,12 @@ static void stm32_clock_enable(unsigned long clock_id)
 {
 	int index = clock_id_to_gate_index(clock_id);
 
-	if (index >= 0)
+	if (index >= 0) {
 		__clk_enable(stm32mp1_clk_gate + index);
+
+		/* Make sure the clock is enable before to return to caller */
+		dsb();
+	}
 
 	assert(clock_id_to_always_on_index(clock_id) >= 0);
 }
@@ -4245,39 +4247,27 @@ static TEE_Result stm32_clock_pm(enum pm_op op, unsigned int pm_hint __unused,
 				 const struct pm_callback_handle *hdl __unused)
 {
 	if (op == PM_OP_SUSPEND) {
+		/* Make sure the pending operations are visible */
+		dsb();
 		stm32_clock_suspend();
 	} else {
 		pll1_config_from_opp_khz(current_opp_khz);
 		stm32_clock_resume();
+		/* Make sure the clock are restored */
+		dsb();
 	}
 
 	return TEE_SUCCESS;
 }
 DECLARE_KEEP_PAGER(stm32_clock_pm);
 
-static TEE_Result stm32mp1_rcc_mco_probe(const void *fdt, int node,
-					 const void *compat_data __unused)
-{
-	static struct stm32_pinctrl_list *pinctrl_cfg = NULL;
-
-	/* Get pinctrl config loaded */
-	return stm32_pinctrl_dt_get_by_index(fdt, node, 0, &pinctrl_cfg);
-}
-
-static const struct dt_device_match stm32mp1_rcc_mco_match_table[] = {
-	{ .compatible = "st,stm32mp1-rcc-mco" },
-	{ }
-};
-
-DEFINE_DT_DRIVER(stm32mp1_rcc_mco_dt_driver) = {
-	.name = "stm32mp1_rcc_mco",
-	.match_table = stm32mp1_rcc_mco_match_table,
-	.probe = stm32mp1_rcc_mco_probe,
-};
 
 void stm32_reset_system(void)
 {
 	vaddr_t rcc = stm32_rcc_base();
+
+	/* Make sure the pending operations are visible */
+	dsb();
 
 	io_write32(rcc + RCC_MP_GRSTCSETR, RCC_MP_GRSTCSETR_MPSYSRST);
 }

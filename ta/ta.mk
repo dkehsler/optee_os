@@ -188,12 +188,18 @@ $(foreach f, $(ta-srcfiles), \
 	$(eval $(call copy-file, $(f), $(out-dir)/export-$(sm)/src)))
 
 # Copy keys
-ta-keys = keys/default_ta.pem
+ta-keys := $(TA_SIGN_KEY)
+# default_ta.pem is a symlink to default.pem, for backwards compatibility.
+# If default_ta.pem is used, copy both files.
+ifeq ($(TA_SIGN_KEY),keys/default_ta.pem)
+ta-keys += keys/default.pem
+endif
+
 $(foreach f, $(ta-keys), \
 	$(eval $(call copy-file, $(f), $(out-dir)/export-$(sm)/keys)))
 
 # Copy the scripts
-ta-scripts = scripts/sign_encrypt.py scripts/symbolize.py
+ta-scripts = scripts/sign_encrypt.py scripts/symbolize.py scripts/sign_rproc_fw.py
 $(foreach f, $(ta-scripts), \
 	$(eval $(call copy-file, $(f), $(out-dir)/export-$(sm)/scripts)))
 

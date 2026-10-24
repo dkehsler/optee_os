@@ -85,6 +85,8 @@ static TEE_Result pwr_set_state(const struct regul_desc *desc, bool enable)
 		if (!(io_read32(pwr_cr3) & ready_mask))
 			return TEE_ERROR_GENERIC;
 	} else {
+		/* Make sure the previous operations are visible */
+		dsb();
 		io_clrbits32(pwr_cr3, enable_mask);
 	}
 
@@ -215,3 +217,10 @@ DEFINE_DT_DRIVER(stm32mp1_pwr_regu_dt_driver) = {
 	.probe = stm32mp1_pwr_regu_probe,
 };
 #endif /* CFG_EMBED_DTB */
+
+void stm32mp_pwr_monitoring_enable(void)
+{
+	vaddr_t pwr_base = stm32_pwr_base();
+
+	io_setbits32(pwr_base + PWR_CR2_OFF, PWR_CR2_MONEN);
+}

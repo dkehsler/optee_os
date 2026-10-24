@@ -119,6 +119,9 @@ TEE_Result stm32_reset_assert(struct rstctrl *rstctrl, unsigned int to_us)
 
 		if (!(io_read32(rcc_base + offset) & bit_mask))
 			return TEE_ERROR_SECURITY;
+	} else {
+		/* Make sure the above write is performed */
+		dsb();
 	}
 
 	return TEE_SUCCESS;
@@ -144,6 +147,9 @@ TEE_Result stm32_reset_deassert(struct rstctrl *rstctrl, unsigned int to_us)
 
 		if (io_read32(rcc_base + offset) & bit_mask)
 			return TEE_ERROR_SECURITY;
+	} else {
+		/* Make sure the above write is performed */
+		dsb();
 	}
 
 	return TEE_SUCCESS;
@@ -171,6 +177,9 @@ TEE_Result stm32_reset_assert_clr_offset(struct rstctrl *rstctrl,
 
 		if (!(io_read32(rcc_base + offset) & bit_mask))
 			return TEE_ERROR_SECURITY;
+	} else {
+		/* Make sure the above write is performed */
+		dsb();
 	}
 
 	return TEE_SUCCESS;
@@ -198,6 +207,9 @@ TEE_Result stm32_reset_deassert_clr_offset(struct rstctrl *rstctrl,
 
 		if (io_read32(rcc_base + offset) & bit_mask)
 			return TEE_ERROR_SECURITY;
+	} else {
+		/* Make sure the above write is performed */
+		dsb();
 	}
 
 	return TEE_SUCCESS;
@@ -217,10 +229,11 @@ struct rstctrl_ops stm32_rstctrl_clr_offset_ops = {
 	.assert_level = stm32_reset_assert_clr_offset,
 	.deassert_level = stm32_reset_deassert_clr_offset,
 };
+DECLARE_KEEP_PAGER(stm32_rstctrl_clr_offset_ops);
 
 #ifdef CFG_EMBED_DTB
-static struct rstctrl *stm32_rstctrl_get_dev(struct dt_driver_phandle_args *arg,
-					     void *priv_data,
+static struct rstctrl *stm32_rstctrl_get_dev(struct dt_pargs *arg,
+					     void *priv_data __unused,
 					     TEE_Result *res)
 {
 	struct stm32_rstline *stm32_rstline = NULL;

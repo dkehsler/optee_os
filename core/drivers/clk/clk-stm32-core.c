@@ -62,7 +62,7 @@ TEE_Result stm32_mux_set_parent(uint16_t mux_id, uint8_t sel)
 }
 
 /* STM32 GATE API */
-static void stm32_gate_endisable(uint16_t gate_id, bool enable)
+void stm32_gate_endisable(uint16_t gate_id, bool enable)
 {
 	struct clk_stm32_priv *priv = clk_stm32_get_priv();
 	const struct gate_cfg *gate = &priv->gates[gate_id];
@@ -73,7 +73,12 @@ static void stm32_gate_endisable(uint16_t gate_id, bool enable)
 			io_write32(addr, BIT(gate->bit_idx));
 		else
 			io_setbits32_stm32shregs(addr, BIT(gate->bit_idx));
+		/* Make sure the clock is enabled before returning to caller */
+		dsb();
 	} else {
+		/* Waiting pending operation before disabling clock */
+		dsb();
+
 		if (gate->set_clr)
 			io_write32(addr + RCC_MP_ENCLRR_OFFSET,
 				   BIT(gate->bit_idx));
@@ -295,7 +300,7 @@ TEE_Result stm32_div_set_value(uint32_t div_id, uint32_t value)
 	return stm32_gate_wait_ready((uint16_t)divider->ready, true);
 }
 
-static unsigned long stm32_div_get_rate(int div_id, unsigned long prate)
+unsigned long stm32_div_get_rate(int div_id, unsigned long prate)
 {
 	struct clk_stm32_priv *priv = clk_stm32_get_priv();
 	const struct div_cfg *divider = &priv->div[div_id];
@@ -346,7 +351,7 @@ const struct clk_ops clk_stm32_mux_ops = {
 };
 
 /* STM32 GATE clock operators */
-static TEE_Result clk_stm32_gate_enable(struct clk *clk)
+TEE_Result clk_stm32_gate_enable(struct clk *clk)
 {
 	struct clk_stm32_gate_cfg *cfg = clk->priv;
 
@@ -355,14 +360,14 @@ static TEE_Result clk_stm32_gate_enable(struct clk *clk)
 	return TEE_SUCCESS;
 }
 
-static void clk_stm32_gate_disable(struct clk *clk)
+void clk_stm32_gate_disable(struct clk *clk)
 {
 	struct clk_stm32_gate_cfg *cfg = clk->priv;
 
 	stm32_gate_disable(cfg->gate_id);
 }
 
-static bool clk_stm32_gate_is_enabled(struct clk *clk)
+bool clk_stm32_gate_is_enabled(struct clk *clk)
 {
 	struct clk_stm32_gate_cfg *cfg = clk->priv;
 
@@ -375,14 +380,33 @@ const struct clk_ops clk_stm32_gate_ops = {
 	.is_enabled	= clk_stm32_gate_is_enabled,
 };
 
-static TEE_Result clk_stm32_gate_ready_enable(struct clk *clk)
+#ifdef CFG_PM
+static void clk_stm32_gate_pm_restore(struct clk *clk)
+{
+	struct clk_stm32_gate_cfg *cfg = clk->priv;
+
+	if (clk_is_enabled(clk))
+		stm32_gate_endisable(cfg->gate_id, true);
+}
+#endif
+
+const struct clk_ops clk_stm32_gate_pm_ops = {
+	.enable		= clk_stm32_gate_enable,
+	.disable	= clk_stm32_gate_disable,
+	.is_enabled	= clk_stm32_gate_is_enabled,
+#ifdef CFG_PM
+	.restore_context = clk_stm32_gate_pm_restore,
+#endif
+};
+
+TEE_Result clk_stm32_gate_ready_enable(struct clk *clk)
 {
 	struct clk_stm32_gate_cfg *cfg = clk->priv;
 
 	return stm32_gate_rdy_enable(cfg->gate_id);
 }
 
-static void clk_stm32_gate_ready_disable(struct clk *clk)
+void clk_stm32_gate_ready_disable(struct clk *clk)
 {
 	struct clk_stm32_gate_cfg *cfg = clk->priv;
 
@@ -537,11 +561,14 @@ int fdt_clk_stm32_parse_by_name(const void *fdt, int node, const char *name,
 	uint32_t i = 0;
 
 	cell = fdt_getprop(fdt, node, name, &len);
-	if (cell)
+	if (cell && len > 0) {
 		for (i = 0; i < ((uint32_t)len / sizeof(uint32_t)); i++)
 			tab[i] = fdt32_to_cpu(cell[i]);
 
-	*nb = (uint32_t)len / sizeof(uint32_t);
+		*nb = (uint32_t)len / sizeof(uint32_t);
+	} else {
+		*nb = 0;
+	}
 
 	return 0;
 }
@@ -602,7 +629,7 @@ struct clk *stm32mp_rcc_clock_id_to_clk(unsigned long clock_id)
 }
 #endif
 
-static struct clk *stm32mp_clk_dt_get_clk(struct dt_driver_phandle_args *pargs,
+static struct clk *stm32mp_clk_dt_get_clk(struct dt_pargs *pargs,
 					  void *data __unused, TEE_Result *res)
 {
 	unsigned long clock_id = pargs->args[0];

@@ -13,6 +13,7 @@
 #include <kernel/delay.h>
 #include <kernel/dt.h>
 #include <kernel/mutex.h>
+#include <kernel/pm.h>
 #include <libfdt.h>
 #include <mm/core_memprot.h>
 #include <stdint.h>
@@ -34,9 +35,6 @@
 #define MAX_BLOCK_SIZE_BIT		AES_BLOCK_SIZE_BIT
 #define MAX_BLOCK_SIZE			AES_BLOCK_SIZE
 #define MAX_BLOCK_NB_U32		AES_BLOCK_NB_U32
-#define AES_KEYSIZE_128			16U
-#define AES_KEYSIZE_192			24U
-#define AES_KEYSIZE_256			32U
 
 /* CRYP control register */
 #define _CRYP_CR			0x0U
@@ -97,6 +95,7 @@
 
 #define CRYP_TIMEOUT_US			1000000U
 #define TIMEOUT_US_1MS			1000U
+#define CRYP_RESET_DELAY		U(2)
 
 /* CRYP control register fields */
 #define _CRYP_CR_RESET_VALUE		0x0U
@@ -1247,6 +1246,51 @@ out:
 	return res;
 }
 
+static TEE_Result stm32_cryp_reset(void)
+{
+	TEE_Result ret = TEE_SUCCESS;
+
+	if (!cryp_pdata.reset)
+		return ret;
+
+	ret = rstctrl_assert_to(cryp_pdata.reset, TIMEOUT_US_1MS);
+	if (ret)
+		return ret;
+
+	udelay(CRYP_RESET_DELAY);
+
+	return rstctrl_deassert_to(cryp_pdata.reset, TIMEOUT_US_1MS);
+}
+
+static TEE_Result stm32_cryp_pm(enum pm_op op, uint32_t pm_hint,
+				const struct pm_callback_handle *hdl __unused)
+{
+	TEE_Result ret = TEE_ERROR_NOT_IMPLEMENTED;
+
+	switch (op) {
+	case PM_OP_SUSPEND:
+		clk_disable(cryp_pdata.clock);
+		ret = TEE_SUCCESS;
+		break;
+	case PM_OP_RESUME:
+		ret = clk_enable(cryp_pdata.clock);
+		if (ret)
+			return ret;
+
+		if (PM_HINT_IS_STATE(pm_hint, CONTEXT)) {
+			ret = stm32_cryp_reset();
+			if (ret)
+				panic();
+		}
+		break;
+	default:
+		break;
+	}
+
+	return ret;
+}
+DECLARE_KEEP_PAGER(stm32_cryp_pm);
+
 static TEE_Result stm32_cryp_probe(const void *fdt, int node,
 				   const void *compt_data __unused)
 {
@@ -1282,10 +1326,7 @@ static TEE_Result stm32_cryp_probe(const void *fdt, int node,
 	if (clk_enable(cryp_pdata.clock))
 		panic();
 
-	if (rstctrl && rstctrl_assert_to(cryp_pdata.reset, TIMEOUT_US_1MS))
-		panic();
-
-	if (rstctrl && rstctrl_deassert_to(cryp_pdata.reset, TIMEOUT_US_1MS))
+	if (stm32_cryp_reset())
 		panic();
 
 	if (IS_ENABLED(CFG_CRYPTO_DRV_AUTHENC)) {
@@ -1303,6 +1344,9 @@ static TEE_Result stm32_cryp_probe(const void *fdt, int node,
 			panic();
 		}
 	}
+
+	if (IS_ENABLED(CFG_PM))
+		register_pm_core_service_cb(stm32_cryp_pm, NULL, "stm32-cryp");
 
 	return TEE_SUCCESS;
 }

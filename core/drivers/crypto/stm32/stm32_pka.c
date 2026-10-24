@@ -12,6 +12,8 @@
 #include <kernel/delay.h>
 #include <kernel/dt.h>
 #include <kernel/mutex.h>
+#include <kernel/pm.h>
+#include <kernel/pm.h>
 #include <libfdt.h>
 #include <mm/core_memprot.h>
 #include <stm32_util.h>
@@ -1143,13 +1145,14 @@ static TEE_Result stm32_pka_ecdsa_verif_ret(const vaddr_t base)
 	return TEE_ERROR_BAD_PARAMETERS;
 }
 
-TEE_Result stm32_pka_ecdsa_verif(const void *hash, const unsigned int hash_size,
+TEE_Result stm32_pka_ecdsa_verif(const void *hash, unsigned int hash_size,
 				 const struct stm32_pka_bn *sig_r,
 				 const struct stm32_pka_bn *sig_s,
 				 const struct stm32_pka_point *pk,
 				 const enum stm32_pka_curve_id cid)
 {
 	TEE_Result res = TEE_SUCCESS;
+	uint32_t n_len_bytes = curve_def[cid].n_len / INT8_LEN;
 	vaddr_t base = io_pa_or_va(&pka_pdata.pa_or_va, 1);
 	unsigned int eo_nbw = get_ecc_op_nbword(cid);
 
@@ -1188,6 +1191,14 @@ TEE_Result stm32_pka_ecdsa_verif(const void *hash, const unsigned int hash_size,
 		goto out;
 
 	/*    With hash */
+	if (n_len_bytes < hash_size) {
+		/*
+		 * Hash size is greater than ECDSA prime curve size.
+		 * Truncate hash and use leftmost bits of the hash.
+		 * NIST.FIPS.186-5.pdf
+		 */
+		hash_size = n_len_bytes;
+	}
 	res = write_eo_data(base + _PKA_RAM_VERIF_HASH_Z, hash, hash_size,
 			    eo_nbw);
 	if (res)
@@ -1292,7 +1303,7 @@ static TEE_Result stm32_pka_ecdsa_sign_ret(const vaddr_t base,
 	return TEE_SUCCESS;
 }
 
-TEE_Result stm32_pka_ecdsa_sign(const void *hash, const unsigned int hash_size,
+TEE_Result stm32_pka_ecdsa_sign(const void *hash, unsigned int hash_size,
 				struct stm32_pka_bn *sig_r,
 				struct stm32_pka_bn *sig_s,
 				const struct stm32_pka_bn *d,
@@ -1300,6 +1311,7 @@ TEE_Result stm32_pka_ecdsa_sign(const void *hash, const unsigned int hash_size,
 				const enum stm32_pka_curve_id cid)
 {
 	TEE_Result res = TEE_SUCCESS;
+	uint32_t n_len_bytes = curve_def[cid].n_len / INT8_LEN;
 	vaddr_t base = io_pa_or_va(&pka_pdata.pa_or_va, 1);
 	unsigned int eo_nbw = get_ecc_op_nbword(cid);
 
@@ -1337,6 +1349,14 @@ TEE_Result stm32_pka_ecdsa_sign(const void *hash, const unsigned int hash_size,
 		goto out;
 
 	/*    With hash */
+	if (n_len_bytes < hash_size) {
+		/*
+		 * Hash size is greater than ECDSA prime curve size.
+		 * Truncate hash and use leftmost bits of the hash.
+		 * NIST.FIPS.186-4.pdf
+		 */
+		hash_size = n_len_bytes;
+	}
 	res = write_eo_data(base + _PKA_RAM_SIGN_HASH_Z, hash, hash_size,
 			    eo_nbw);
 	if (res)
@@ -1531,7 +1551,11 @@ static TEE_Result stm32_pka_parse_fdt(struct stm32_pka_platdata *pdata,
 	if (res != TEE_SUCCESS && res != TEE_ERROR_ITEM_NOT_FOUND)
 		return res;
 
-	res = clk_dt_get_by_index(fdt, node, 0, &pdata->clk);
+	res = clk_dt_get_by_name(fdt, node, "bus", &pdata->clk);
+	if (res)
+		return res;
+
+	res = clk_dt_get_by_name(fdt, node, "rng", &pdata->clk_rng);
 	if (res)
 		return res;
 
@@ -1560,6 +1584,53 @@ int stm32_pka_get_platdata(struct stm32_pka_platdata *pdata __unused)
 }
 #endif
 
+static TEE_Result stm32_pka_reset(void)
+{
+	TEE_Result ret = TEE_SUCCESS;
+
+	if (!pka_pdata.reset)
+		return ret;
+
+	ret = rstctrl_assert_to(pka_pdata.reset, TIMEOUT_US_1MS);
+	if (ret)
+		return ret;
+
+	udelay(PKA_RESET_DELAY);
+
+	return rstctrl_deassert_to(pka_pdata.reset, TIMEOUT_US_1MS);
+}
+
+static TEE_Result stm32_pka_pm(enum pm_op op, uint32_t pm_hint,
+			       const struct pm_callback_handle *hdl __unused)
+{
+	TEE_Result ret = TEE_ERROR_NOT_IMPLEMENTED;
+
+	switch (op) {
+	case PM_OP_SUSPEND:
+		clk_disable(pka_pdata.clk);
+		clk_disable(pka_pdata.clk_rng);
+		ret = TEE_SUCCESS;
+		break;
+	case PM_OP_RESUME:
+		if (clk_enable(pka_pdata.clk) ||
+		    clk_enable(pka_pdata.clk_rng))
+			panic();
+
+		if (PM_HINT_IS_STATE(pm_hint, CONTEXT)) {
+			ret = stm32_pka_reset();
+			if (ret)
+				panic();
+		}
+
+		ret = TEE_SUCCESS;
+		break;
+	default:
+		break;
+	}
+
+	return ret;
+}
+
 /*
  * @brief  Initialize the PKA driver.
  * @param  None.
@@ -1580,15 +1651,10 @@ static TEE_Result stm32_pka_probe(const void *fdt, int node,
 	if (res)
 		return res;
 
-	clk_enable(pka_pdata.clk);
-
-	if (pka_pdata.reset &&
-	    rstctrl_assert_to(pka_pdata.reset, TIMEOUT_US_1MS) != 0)
+	if (clk_enable(pka_pdata.clk) || clk_enable(pka_pdata.clk_rng))
 		panic();
 
-	udelay(PKA_RESET_DELAY);
-	if (pka_pdata.reset &&
-	    rstctrl_deassert_to(pka_pdata.reset, TIMEOUT_US_1MS) != 0)
+	if (stm32_pka_reset())
 		panic();
 
 #if TRACE_LEVEL >= TRACE_FLOW
@@ -1610,6 +1676,9 @@ static TEE_Result stm32_pka_probe(const void *fdt, int node,
 			panic();
 		}
 	}
+
+	if (IS_ENABLED(CFG_PM))
+		register_pm_core_service_cb(stm32_pka_pm, NULL, "stm32-pka");
 
 	return TEE_SUCCESS;
 }

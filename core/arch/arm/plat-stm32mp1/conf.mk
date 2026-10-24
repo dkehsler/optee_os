@@ -66,11 +66,91 @@ flavorlist-MP15 = $(flavor_dts_file-157A_DHCOR_AVENGER96) \
 flavorlist-MP13 = $(flavor_dts_file-135D_ODYSSEY) \
 $(flavor_dts_file-135F_DK)
 
+# External device tree default path
+CFG_EXT_DTS ?= $(arch-dir)/dts/external-dt/optee
+
+# Extend flavorlists with external device trees
+ifneq ($(wildcard $(CFG_EXT_DTS)/conf.mk),)
+-include $(CFG_EXT_DTS)/conf.mk
+endif
+
+# List of all DTS for this PLATFORM
+ALL_DTS = $(flavorlist-MP15) $(flavorlist-MP13)
+
+# Check if device-tree exist in OP-TEE source code, else search it in external
+# device tree repository
+ifeq ($(wildcard $(arch-dir)/dts/$(CFG_EMBED_DTB_SOURCE_FILE)),)
+ifneq ($(wildcard $(CFG_EXT_DTS)/$(CFG_EMBED_DTB_SOURCE_FILE)),)
+override dts-source-path := $(CFG_EXT_DTS)
+else
+$(error Cannot find DTS file $(CFG_EXT_DTS)/$(CFG_EMBED_DTB_SOURCE_FILE))
+endif
+endif
+
 ifneq ($(PLATFORM_FLAVOR),)
 ifeq ($(flavor_dts_file-$(PLATFORM_FLAVOR)),)
 $(error Invalid platform flavor $(PLATFORM_FLAVOR))
 endif
 CFG_EMBED_DTB_SOURCE_FILE ?= $(flavor_dts_file-$(PLATFORM_FLAVOR))
+endif
+CFG_EMBED_DTB_SOURCE_FILE ?= stm32mp157c-dk2.dts
+
+# CFG_STM32MP1x switches are exclusive.
+# - CFG_STM32MP15 is enabled for STM32MP15x-* targets (default)
+# - CFG_STM32MP13 is enabled for STM32MP13x-* targets
+# We try to guess the variant from the embedded DT source file name
+ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-MP13)),)
+$(call force,CFG_STM32MP13,y)
+endif
+ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-MP15)),)
+$(call force,CFG_STM32MP15,y)
+endif
+
+ifeq ($(CFG_STM32MP13),y)
+$(call force,CFG_STM32MP15,n)
+else
+$(call force,CFG_STM32MP15,y)
+$(call force,CFG_STM32MP13,n)
+endif
+
+ifeq ($(call cfg-one-enabled,CFG_STM32MP15 CFG_STM32MP13),n)
+$(error One of CFG_STM32MP15 CFG_STM32MP13 must be enabled)
+endif
+ifeq ($(call cfg-all-enabled,CFG_STM32MP15 CFG_STM32MP13),y)
+$(error Only one of CFG_STM32MP15 CFG_STM32MP13 must be enabled)
+endif
+
+# CFG_STM32MP_PROFILE selects the profile of the services embedded
+# in OP-TEE.
+
+ifeq ($(CFG_STM32MP13),y)
+# STM32MP13: default select secure_and_system_services.
+# Alternate system_services is supported.
+CFG_STM32MP_PROFILE ?= secure_and_system_services
+endif #CFG_STM32MP13
+
+ifeq ($(CFG_STM32MP15),y)
+# STM32MP15: default select system_services, OP-TEE executes in DDR
+# (i.e. CFG_STM32MP1_OPTEE_IN_SYSRAM=n).
+# Alternate secure_and_system_services executes in SRAM
+# (i.e. CFG_STM32MP1_OPTEE_IN_SYSRAM=y).
+ifeq ($(CFG_STM32MP1_OPTEE_IN_SYSRAM),y)
+$(call force,CFG_STM32MP_PROFILE,secure_and_system_services)
+endif
+CFG_STM32MP_PROFILE ?= system_services
+ifeq ($(CFG_STM32MP_PROFILE),secure_and_system_services)
+$(call force,CFG_STM32MP1_OPTEE_IN_SYSRAM,y,Required by secure_and_system_services profile)
+else
+$(call force,CFG_STM32MP1_OPTEE_IN_SYSRAM,n,Required by system_services profile)
+endif
+endif #CFG_STM32MP15
+
+ifeq ($(filter $(CFG_STM32MP_PROFILE),system_services secure_and_system_services),)
+$(error CFG_STM32MP_PROFILE shall be one of system_services or secure_and_system_services)
+endif
+
+ifeq ($(CFG_STM32MP_PROFILE),system_services)
+include $(platform-dir)/conf.disable-secure-services.mk
 endif
 
 ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-no_cryp)),)
@@ -81,40 +161,19 @@ endif
 
 ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-no_rng)),)
 $(call force,CFG_HWRNG_PTA,n)
-$(call force,CFG_WITH_SOFTWARE_PRNG,y)
-endif
-
-ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-MP13)),)
-$(call force,CFG_STM32MP13,y)
-endif
-
-ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-MP15)),)
-$(call force,CFG_STM32MP15,y)
+$(call force,CFG_STM32_PKA,n)
+$(call force,CFG_STM32_SAES,n)
+CFG_WITH_SOFTWARE_PRNG ?= y
 endif
 
 # Default do not access external DT passed to non-secure boot stage
 CFG_EXTERNAL_DT ?= n
 
-# CFG_STM32MP1x switches are exclusive.
-# - CFG_STM32MP15 is enabled for STM32MP15x-* targets (default)
-# - CFG_STM32MP13 is enabled for STM32MP13x-* targets
-ifeq ($(CFG_STM32MP13),y)
-$(call force,CFG_STM32MP15,n)
-else
-$(call force,CFG_STM32MP15,y)
-$(call force,CFG_STM32MP13,n)
-endif
-ifeq ($(call cfg-one-enabled,CFG_STM32MP15 CFG_STM32MP13),n)
-$(error One of CFG_STM32MP15 CFG_STM32MP13 must be enabled)
-endif
-ifeq ($(call cfg-all-enabled,CFG_STM32MP15 CFG_STM32MP13),y)
-$(error Only one of CFG_STM32MP15 CFG_STM32MP13 must be enabled)
-endif
-
 include core/arch/arm/cpu/cortex-a7.mk
 
 $(call force,CFG_ARM_GIC_PM,y)
 $(call force,CFG_DRIVERS_CLK,y)
+$(call force,CFG_DRIVERS_CLK_DT,y)
 $(call force,CFG_GIC,y)
 $(call force,CFG_INIT_CNTVOFF,y)
 $(call force,CFG_PM,y)
@@ -122,6 +181,7 @@ $(call force,CFG_PM_ARM32,y)
 $(call force,CFG_PM_STUBS,y)
 $(call force,CFG_PSCI_ARM32,y)
 $(call force,CFG_REGULATOR_DRIVERS,y)
+$(call force,CFG_SCMI_PTA,y)
 $(call force,CFG_SECURE_TIME_SOURCE_CNTPCT,y)
 $(call force,CFG_SM_PLATFORM_HANDLER,y)
 $(call force,CFG_STM32_SHARED_IO,y)
@@ -134,22 +194,28 @@ $(call force,CFG_CORE_RESERVED_SHM,n)
 $(call force,CFG_DRIVERS_ADC,y)
 $(call force,CFG_DRIVERS_CLK_FIXED,y)
 $(call force,CFG_SECONDARY_INIT_CNTFRQ,n)
-$(call force,CFG_STM32_ADC,y)
 $(call force,CFG_STM32_EXTI,y)
 $(call force,CFG_STM32_GPIO,y)
 $(call force,CFG_STM32_HSE_MONITORING,y)
 $(call force,CFG_STM32MP_CLK_CORE,y)
-$(call force,CFG_RPROC_PTA,n)
 $(call force,CFG_STM32MP1_OPTEE_IN_SYSRAM,n)
-$(call force,CFG_STM32MP1_SCMI_SIP,n)
 $(call force,CFG_STM32MP1_SHARED_RESOURCES,n)
 $(call force,CFG_STM32MP13_CLK,y)
 $(call force,CFG_STM32MP13_RSTCTRL,y)
 $(call force,CFG_TEE_CORE_NB_CORE,1)
 $(call force,CFG_WITH_NSEC_GPIOS,n)
 CFG_STM32MP_OPP_COUNT ?= 2
+CFG_STM32_ADC ?= y
 CFG_WITH_PAGER ?= n
 CFG_WITH_TUI ?= y
+CFG_SCMI_SCPFW ?= n
+ifeq ($(CFG_SCMI_SCPFW),y)
+$(call force,CFG_SCMI_SERVER_REGULATOR_CONSUMER,y)
+else
+$(call force,CFG_SCMI_MSG_DRIVERS,y)
+$(call force,CFG_SCMI_MSG_REGULATOR_CONSUMER,y)
+$(call force,CFG_SCMI_MSG_PERF_DOMAIN,y)
+endif
 endif # CFG_STM32MP13
 
 ifeq ($(CFG_STM32MP15),y)
@@ -157,6 +223,8 @@ $(call force,CFG_BOOT_SECONDARY_REQUEST,y)
 $(call force,CFG_CORE_RESERVED_SHM,n)
 $(call force,CFG_DDR_LOWPOWER,y)
 $(call force,CFG_SCMI_MSG_PERF_DOMAIN,n)
+$(call force,CFG_SCMI_MSG_REGULATOR_CONSUMER,n)
+$(call force,CFG_SCMI_SERVER_REGULATOR_CONSUMER,n)
 $(call force,CFG_DRIVERS_CLK_FIXED,y)
 $(call force,CFG_SECONDARY_INIT_CNTFRQ,y)
 $(call force,CFG_STM32MP1_SHARED_RESOURCES,y)
@@ -167,16 +235,15 @@ $(call force,CFG_STM32MP15_CLK,y)
 $(call force,CFG_STM32MP15_RSTCTRL,y)
 $(call force,CFG_STM32MP_CLK_CORE,y)
 CFG_SCMI_MSG_REGULATOR_CONSUMER ?= n
+CFG_SCMI_SCPFW ?= n
+ifneq ($(CFG_SCMI_SCPFW),y)
+$(call force,CFG_SCMI_MSG_DRIVERS,y)
+endif
 CFG_TEE_CORE_NB_CORE ?= 2
 CFG_STM32MP1_OPTEE_IN_SYSRAM ?= n
 ifeq ($(CFG_STM32MP1_OPTEE_IN_SYSRAM),y)
 $(call force,CFG_WITH_PAGER,y)
 CFG_STM32MP15_HUK ?= y
-CFG_WITH_USER_TA ?= y
-else
-CFG_STM32MP15_HUK ?= n
-CFG_WITH_PAGER ?= n
-CFG_WITH_USER_TA ?= n
 endif
 ifeq ($(CFG_WITH_PAGER),y)
 CFG_WITH_LPAE ?= n
@@ -187,6 +254,16 @@ CFG_WITH_LPAE ?= y
 CFG_MMAP_REGIONS ?= 30
 CFG_DTB_MAX_SIZE ?= (256 * 1024)
 CFG_CORE_ASLR ?= n
+
+CFG_STM32MP_REMOTEPROC ?= n
+CFG_DRIVERS_REMOTEPROC ?= $(CFG_STM32MP_REMOTEPROC)
+CFG_REMOTEPROC_PTA ?= $(CFG_STM32MP_REMOTEPROC)
+ifeq ($(CFG_REMOTEPROC_PTA),y)
+# Remoteproc early TA for coprocessor firmware management in boot stages
+CFG_IN_TREE_EARLY_TAS += remoteproc/80a4c275-0a47-4905-8285-1486a9771a08
+# Embed public part of this key in OP-TEE OS
+RPROC_SIGN_KEY ?= keys/default.pem
+endif
 
 ifneq ($(CFG_WITH_LPAE),y)
 # Without LPAE, default TEE virtual address range is 1MB, we need at least 2MB.
@@ -203,38 +280,6 @@ CFG_TUI_FRAME_BUFFER_SIZE_MAX ?= 0x01000000
 CFG_RESERVED_VASPACE_SIZE ?= (10 * 1024 * 1024 + $(CFG_TUI_FRAME_BUFFER_SIZE_MAX))
 endif
 
-# Disable early TA compression to limit HEAP size
-CFG_EARLY_TA_COMPRESS ?= n
-
-# Embed public part of this key in OP-TEE OS
-CFG_RPROC_SIGN_KEY ?= keys/default_rproc.pem
-
-ifeq ($(CFG_EMBED_DTB_SOURCE_FILE),)
-# Some drivers mandate DT support
-$(call force,CFG_DRIVERS_CLK_DT,n)
-$(call force,CFG_DRIVERS_RSTCTRL,n)
-$(call force,CFG_REGULATOR_FIXED,n)
-$(call force,CFG_STM32_CRYP,n)
-$(call force,CFG_STM32_GPIO,n)
-$(call force,CFG_STM32_HASH,n)
-$(call force,CFG_STM32_HUK_FROM_DT,n)
-$(call force,CFG_STM32_I2C,n)
-$(call force,CFG_STM32_IWDG,n)
-$(call force,CFG_STM32_LPTIMER,n)
-$(call force,CFG_STM32_PKA,n)
-$(call force,CFG_STM32_REGULATOR_GPIO,n)
-$(call force,CFG_STM32_RTC,n)
-$(call force,CFG_STM32_SAES,n)
-$(call force,CFG_STM32_TIM,n)
-$(call force,CFG_STM32_VREFBUF,y)
-$(call force,CFG_STM32_TAMP,n)
-$(call force,CFG_STM32MP1_REGULATOR_IOD,n)
-$(call force,CFG_STM32MP1_SCMI_SIP,n)
-$(call force,CFG_SCMI_PTA,n)
-$(call force,CFG_STPMIC1,n)
-else
-$(call force,CFG_DRIVERS_CLK_DT,y)
-endif
 
 ifneq ($(filter $(CFG_EMBED_DTB_SOURCE_FILE),$(flavorlist-512M)),)
 CFG_DRAM_SIZE    ?= 0x20000000
@@ -248,12 +293,6 @@ CFG_TZSRAM_SIZE  ?= 0x0003f000
 endif #CFG_STM32MP15 && CFG_WITH_PAGER
 CFG_TZDRAM_SIZE  ?= 0x02000000
 CFG_TZDRAM_START ?= ($(CFG_DRAM_BASE) + $(CFG_DRAM_SIZE) - $(CFG_TZDRAM_SIZE))
-
-# Remoteproc early TA for coprocessor firmware management
-CFG_RPROC_PTA ?= n
-ifeq ($(CFG_RPROC_PTA),y)
-CFG_IN_TREE_EARLY_TAS += remoteproc/80a4c275-0a47-4905-8285-1486a9771a08
-endif
 
 CFG_REGULATOR_FIXED ?= y
 CFG_STM32_BSEC ?= y
@@ -275,7 +314,8 @@ CFG_STM32_TAMP ?= y
 CFG_STM32_TIM ?= y
 CFG_STM32_UART ?= y
 CFG_STM32_VREFBUF ?= y
-CFG_STM32MP1_CPU_OPP ?= y
+CFG_STM32_CPU_OPP ?= y
+CFG_STM32MP_PROVISIONING ?= y
 CFG_STM32MP1_REGULATOR_IOD ?= y
 CFG_STPMIC1 ?= y
 CFG_SYSCFG ?= y
@@ -295,10 +335,17 @@ $(call force,CFG_STM32_I2C,y)
 $(call force,CFG_STM32_GPIO,y)
 endif
 
+# Provisioning support for BSEC shadow memory is dedicated to insecure
+# development configuration only.
+ifeq ($(CFG_STM32MP_PROVISIONING),y)
+$(call force,CFG_WARN_INSECURE,y,Required by CFG_STM32MP_PROVISIONING)
+endif
+
+#SAES and CRYP cannot be register at the same time in the crypto framework
 #If CRYP and SAES are enable on STMP32MP13, disable CRYP for safety purpose
-ifeq ($(call cfg-one-enabled, CFG_STM32MP13),y)
+ifeq ($(CFG_STM32MP13),y)
 ifeq ($(call cfg-all-enabled, CFG_STM32_CRYP CFG_STM32_SAES), y)
-CFG_STM32_CRYP := n
+override CFG_STM32_CRYP := n
 endif # cfg-all-enabled, CFG_STM32_CRYP CFG_STM32_SAES
 endif # cfg-one-enabled, CFG_STM32MP13
 
@@ -333,12 +380,6 @@ CFG_STM32MP_PANIC_ON_TZC_PERM_VIOLATION ?= y
 # SiP/OEM service for non-secure world
 CFG_STM32_LOWPOWER_SIP ?= $(CFG_PM)
 CFG_STM32_PWR_SIP ?= $(CFG_STM32MP15)
-CFG_STM32MP1_SCMI_SIP ?= n
-ifeq ($(CFG_STM32MP1_SCMI_SIP),y)
-$(call force,CFG_SCMI_MSG_DRIVERS,y,Mandated by CFG_STM32MP1_SCMI_SIP)
-$(call force,CFG_SCMI_MSG_SMT,y,Mandated by CFG_STM32MP1_SCMI_SIP)
-$(call force,CFG_SCMI_MSG_SMT_FASTCALL_ENTRY,y,Mandated by CFG_STM32MP1_SCMI_SIP)
-endif
 
 # Enable BSEC Pseudo TA for fuses access management
 CFG_BSEC_PTA ?= y
@@ -346,10 +387,28 @@ ifeq ($(CFG_BSEC_PTA),y)
 $(call force,CFG_STM32_BSEC,y,Mandated by CFG_BSEC_PTA)
 endif
 
-# Default enable SCMI PTA support
-CFG_SCMI_PTA ?= y
-ifeq ($(CFG_SCMI_PTA),y)
-$(call force,CFG_SCMI_MSG_DRIVERS,y,Mandated by CFG_SCMI_PTA)
+# SCMI configuration
+# When SCMI is embedded, either CFG_SCMI_SCPFW or CFG_SCMI_MSG_DRIVERS
+# shall be enabled exclusively.
+ifeq ($(CFG_SCMI_MSG_DRIVERS)-$(CFG_SCMI_SCPFW),y-y)
+$(error CFG_SCMI_MSG_DRIVERS and CFG_SCMI_SCPFW are exclusive)
+endif
+ifeq ($(filter $(CFG_SCMI_MSG_DRIVERS) $(CFG_SCMI_SCPFW),y),)
+$(error One of CFG_SCMI_MSG_DRIVERS or CFG_SCMI_SCPFW must be enabled)
+endif
+
+ifeq ($(CFG_SCMI_SCPFW),y)
+$(call force,CFG_SCMI_SCPFW_PRODUCT,optee-stm32mp1)
+endif
+
+ifeq ($(CFG_SCMI_MSG_DRIVERS),y)
+$(call force,CFG_SCMI_MSG_CLOCK,y)
+$(call force,CFG_SCMI_MSG_RESET_DOMAIN,y)
+$(call force,CFG_SCMI_MSG_SHM_MSG,y)
+$(call force,CFG_SCMI_MSG_SMT,n)
+$(call force,CFG_SCMI_MSG_SMT_FASTCALL_ENTRY,n)
+$(call force,CFG_SCMI_MSG_SMT_THREAD_ENTRY,n)
+$(call force,CFG_SCMI_MSG_VOLTAGE_DOMAIN,y)
 endif
 
 # Enable Early TA NVMEM for provisioning management
@@ -358,24 +417,16 @@ ifeq ($(CFG_TA_STM32MP_NVMEM),y)
 $(call force,CFG_BSEC_PTA,y,Mandated by CFG_TA_STM32MP_NVMEM)
 CFG_IN_TREE_EARLY_TAS += stm32mp_nvmem/1a8342cc-81a5-4512-99fe-9e2b3e37d626
 endif
+CFG_DRIVERS_NVMEM ?= y
+CFG_STM32_TAMP_NVRAM ?= y
 
-CFG_SCMI_MSG_DRIVERS ?= n
-ifeq ($(CFG_SCMI_MSG_DRIVERS),y)
-$(call force,CFG_SCMI_MSG_CLOCK,y)
-$(call force,CFG_SCMI_MSG_RESET_DOMAIN,y)
-$(call force,CFG_SCMI_MSG_SHM_MSG,y)
-$(call force,CFG_SCMI_MSG_SMT,n)
-CFG_SCMI_MSG_REGULATOR_CONSUMER ?= y
-$(call force,CFG_SCMI_MSG_VOLTAGE_DOMAIN,y)
-CFG_SCMI_MSG_PERF_DOMAIN ?= y
-endif
+# Default enable PKCS11 TA to have PKCS11 tests built in OP-TEE Test
+CFG_PKCS11_TA ?= y
 
 # Default use stm32mp1 PM mailbox context version 3
 CFG_STM32MP1_PM_CONTEXT_VERSION ?= 3
 
-ifneq ($(CFG_WITH_SOFTWARE_PRNG),y)
-CFG_HWRNG_PTA ?= y
-endif
+CFG_HWRNG_PTA ?= $(CFG_STM32_RNG)
 ifeq ($(CFG_HWRNG_PTA),y)
 $(call force,CFG_STM32_RNG,y,Mandated by CFG_HWRNG_PTA)
 $(call force,CFG_WITH_SOFTWARE_PRNG,n,Mandated by CFG_HWRNG_PTA)
@@ -383,7 +434,7 @@ $(call force,CFG_HWRNG_QUALITY,1024)
 endif
 
 # Provision enough threads to pass xtest
-ifneq (,$(filter y,$(CFG_SCMI_PTA) $(CFG_STM32MP1_SCMI_SIP)))
+ifeq ($(CFG_SCMI_PTA),y)
 ifeq ($(CFG_WITH_PAGER),y)
 CFG_NUM_THREADS ?= 3
 else
@@ -395,6 +446,9 @@ endif
 CFG_ENABLE_EMBEDDED_TESTS ?= y
 CFG_WITH_STATS ?= y
 CFG_WERROR ?= y
+
+# Default enable software fallback on crypto drivers
+CFG_STM32_SAES_SW_FALLBACK ?= y
 
 # Enable OTP update with BSEC driver
 CFG_STM32_BSEC_WRITE ?= y

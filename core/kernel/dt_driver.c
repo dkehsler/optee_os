@@ -108,6 +108,7 @@ static void assert_type_is_valid(enum dt_driver_type type)
 	case DT_DRIVER_PINCTRL:
 	case DT_DRIVER_I2C:
 	case DT_DRIVER_ADC:
+	case DT_DRIVER_NVMEM:
 		return;
 	default:
 		assert(0);
@@ -147,6 +148,7 @@ TEE_Result dt_driver_register_provider(const void *fdt, int nodeoffset,
 			return TEE_ERROR_GENERIC;
 		}
 		break;
+	case DT_DRIVER_NOTYPE:
 	case DT_DRIVER_PINCTRL:
 		phandle = fdt_get_phandle(fdt, nodeoffset);
 		if (!phandle)
@@ -158,7 +160,7 @@ TEE_Result dt_driver_register_provider(const void *fdt, int nodeoffset,
 		}
 		break;
 	case DT_DRIVER_I2C:
-	case DT_DRIVER_NOTYPE:
+	case DT_DRIVER_NVMEM:
 		break;
 	default:
 		panic("Trying to register unknown type of provider");
@@ -180,6 +182,16 @@ TEE_Result dt_driver_register_provider(const void *fdt, int nodeoffset,
 	return TEE_SUCCESS;
 }
 
+static bool dt_driver_use_parent_controller(enum dt_driver_type type __unused)
+{
+	switch (type) {
+	case DT_DRIVER_NVMEM:
+		return true;
+	default:
+		return false;
+	}
+}
+
 /*
  * Helper functions for dt_drivers querying driver provider information
  */
@@ -190,6 +202,9 @@ int fdt_get_dt_driver_cells(const void *fdt, int nodeoffset,
 	const char *cells_name = NULL;
 	const fdt32_t *c = NULL;
 	int len = 0;
+
+	if (dt_driver_use_parent_controller(type))
+		return 0;
 
 	switch (type) {
 	case DT_DRIVER_ADC:
@@ -247,10 +262,10 @@ dt_driver_get_provider_by_phandle(uint32_t phandle, enum dt_driver_type type)
 }
 
 static void *device_from_provider_prop(struct dt_driver_provider *prv,
-					  const uint32_t *prop,
-					  TEE_Result *res)
+				       const void *fdt, int phandle_node,
+				       const uint32_t *prop, TEE_Result *res)
 {
-	struct dt_driver_phandle_args *pargs = NULL;
+	struct dt_pargs *pargs = NULL;
 	unsigned int n = 0;
 	void *device = NULL;
 
@@ -261,6 +276,8 @@ static void *device_from_provider_prop(struct dt_driver_provider *prv,
 		return NULL;
 	}
 
+	pargs->fdt = fdt;
+	pargs->phandle_node = phandle_node;
 	pargs->args_count = prv->provider_cells;
 	for (n = 0; n < prv->provider_cells; n++)
 		pargs->args[n] = fdt32_to_cpu(prop[n + 1]);
@@ -282,6 +299,7 @@ void *dt_driver_device_from_node_idx_prop(const char *prop_name,
 	int idx = 0;
 	int idx32 = 0;
 	int prv_cells = 0;
+	int phandle_node = -1;
 	uint32_t phandle = 0;
 	const uint32_t *prop = NULL;
 	struct dt_driver_provider *prv = NULL;
@@ -305,11 +323,37 @@ void *dt_driver_device_from_node_idx_prop(const char *prop_name,
 			continue;
 		}
 
-		prv = dt_driver_get_provider_by_phandle(phandle, type);
-		if (!prv) {
-			/* No provider registered yet */
-			*res = TEE_ERROR_DEFER_DRIVER_INIT;
-			return NULL;
+		/*
+		 * In some cases, pinctrl, i2c, nvmem, etc, the consumer phandle
+		 * points directly to a subnode of the parent. In such cases,
+		 * the provider does not have any "-cells" property and
+		 * potentially no "phandle" property.
+		 */
+		if (dt_driver_use_parent_controller(type)) {
+			phandle_node = fdt_node_offset_by_phandle(fdt, phandle);
+			if (phandle_node < 0) {
+				*res = TEE_ERROR_GENERIC;
+				return NULL;
+			}
+
+			nodeoffset = fdt_parent_offset(fdt, phandle_node);
+			if (nodeoffset < 0) {
+				*res = TEE_ERROR_GENERIC;
+				return NULL;
+			}
+
+			prv = dt_driver_get_provider_by_node(nodeoffset, type);
+			if (!prv) {
+				*res = TEE_ERROR_DEFER_DRIVER_INIT;
+				return NULL;
+			}
+		} else {
+			prv = dt_driver_get_provider_by_phandle(phandle, type);
+			if (!prv) {
+				/* No provider registered yet */
+				*res = TEE_ERROR_DEFER_DRIVER_INIT;
+				return NULL;
+			}
 		}
 
 		prv_cells = dt_driver_provider_cells(prv);
@@ -319,7 +363,8 @@ void *dt_driver_device_from_node_idx_prop(const char *prop_name,
 			continue;
 		}
 
-		return device_from_provider_prop(prv, prop + idx32, res);
+		return device_from_provider_prop(prv, fdt, phandle_node,
+						 prop + idx32, res);
 	}
 
 	*res = TEE_ERROR_ITEM_NOT_FOUND;
@@ -593,7 +638,7 @@ static TEE_Result add_node_to_probe(const void *fdt, int node,
 	if (!elt)
 		return TEE_ERROR_OUT_OF_MEMORY;
 
-	DMSG("element: %s on node %s", node_name, drv_name);
+	DMSG("element: %s on node %s", drv_name, node_name);
 
 	memcpy(elt, &elt_new, sizeof(*elt));
 
@@ -749,9 +794,8 @@ static TEE_Result probe_dt_drivers(void)
 	if (res || !TAILQ_EMPTY(&dt_driver_failed_list)) {
 		EMSG("Probe sequence result: %#"PRIx32, res);
 		print_probe_list(fdt);
-	}
-	if (res)
 		panic();
+	}
 
 	return TEE_SUCCESS;
 }

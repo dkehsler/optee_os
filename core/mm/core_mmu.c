@@ -479,6 +479,14 @@ void core_mmu_set_discovered_nsec_ddr(struct core_mmu_phys_mem *start,
 	if (!core_mmu_check_end_pa(m[num_elems - 1].addr,
 				   m[num_elems - 1].size))
 		panic();
+
+	if (CFG_TEE_CORE_LOG_LEVEL >= TRACE_DEBUG) {
+		while (num_elems--) {
+			DMSG("Non-secure memory range [%#"PRIxPA" %#"PRIxPA"]",
+			     m->addr, m->addr + m->size);
+			m++;
+		}
+	}
 }
 
 static bool get_discovered_nsec_ddr(const struct core_mmu_phys_mem **start,
@@ -1511,7 +1519,8 @@ static void *map_pa2va(struct tee_mmap_region *map, paddr_t pa, size_t len)
 /*
  * teecore gets some memory area definitions
  */
-void core_mmu_get_mem_by_type(unsigned int type, vaddr_t *s, vaddr_t *e)
+void core_mmu_get_mem_by_type(enum teecore_memtypes type, vaddr_t *s,
+			      vaddr_t *e)
 {
 	struct tee_mmap_region *map = find_map_by_type(type);
 

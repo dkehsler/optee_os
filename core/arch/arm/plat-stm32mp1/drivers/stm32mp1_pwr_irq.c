@@ -11,6 +11,7 @@
 #include <initcall.h>
 #include <io.h>
 #include <kernel/dt.h>
+#include <kernel/dt_driver.h>
 #include <kernel/notif.h>
 #include <kernel/panic.h>
 #include <kernel/spinlock.h>
@@ -46,6 +47,7 @@ struct stm32_pwr_data {
 	struct stm32_pinctrl_list *pinctrl_list;
 	struct itr_handler *hdl[PWR_NB_WAKEUPPINS];
 	struct itr_handler *gic_hdl;
+	struct stm32_exti_pdata *exti;
 	bool threaded[PWR_NB_WAKEUPPINS];
 	bool pending[PWR_NB_WAKEUPPINS];
 	unsigned int spinlock;
@@ -177,7 +179,7 @@ static void stm32mp1_pwr_itr_enable_nolock(size_t it)
 	VERBOSE_PWR("Pwr irq enable");
 
 	if (IS_ENABLED(CFG_STM32_EXTI))
-		stm32_exti_enable_wake(PWR_EXTI_WKUP1 + it);
+		stm32_exti_enable_wake(priv->exti, PWR_EXTI_WKUP1 + it);
 
 	io_setbits32(priv->base + MPUWKUPENR, BIT(it));
 }
@@ -191,7 +193,7 @@ static void stm32mp1_pwr_itr_disable_nolock(size_t it)
 	io_clrbits32(priv->base + MPUWKUPENR, BIT(it));
 
 	if (IS_ENABLED(CFG_STM32_EXTI))
-		stm32_exti_disable_wake(PWR_EXTI_WKUP1 + it);
+		stm32_exti_disable_wake(priv->exti, PWR_EXTI_WKUP1 + it);
 }
 
 static TEE_Result stm32_pwr_irq_set_trig(size_t it, unsigned int flags)
@@ -256,6 +258,7 @@ static TEE_Result stm32mp1_pwr_itr_add(struct itr_handler *hdl)
 	uint32_t exceptions = 0;
 	unsigned int i = 0;
 	bool itr_free = false;
+	TEE_Result res = TEE_SUCCESS;
 
 	VERBOSE_PWR("Pwr IRQ add");
 
@@ -294,6 +297,9 @@ static TEE_Result stm32mp1_pwr_itr_add(struct itr_handler *hdl)
 	stm32mp1_pwr_itr_disable(it);
 
 	stm32_pinctrl_load_config(&pinctrl_list);
+	res = stm32_pinctrl_set_secure_cfg(&pinctrl_list, true);
+	if (res)
+		return res;
 
 	VERBOSE_PWR("Wake-up pin on bank=%"PRIu8" pin=%"PRIu8,
 		    pinctrl->bank, pinctrl->pin);
@@ -315,7 +321,7 @@ static TEE_Result stm32mp1_pwr_itr_add(struct itr_handler *hdl)
 	stm32_pwr_irq_set_trig(it, hdl->flags);
 
 	if (IS_ENABLED(CFG_STM32_EXTI))
-		stm32_exti_set_tz(PWR_EXTI_WKUP1 + it);
+		stm32_exti_set_tz(priv->exti, PWR_EXTI_WKUP1 + it);
 
 	return TEE_SUCCESS;
 }
@@ -365,7 +371,17 @@ stm32mp1_pwr_irq_probe(const void *fdt, int node,
 	priv = pwr_data;
 	priv->base = stm32_pwr_base();
 
-	res = stm32_pinctrl_dt_get_by_index(fdt, node, 0, &priv->pinctrl_list);
+	if (IS_ENABLED(CFG_STM32_EXTI)) {
+		priv->exti =
+			dt_driver_device_from_node_idx_prop("wakeup-parent",
+							    fdt, node, 0,
+							    DT_DRIVER_NOTYPE,
+							    &res);
+		if (res)
+			goto err;
+	}
+
+	res = stm32_pinctrl_dt_read_by_index(fdt, node, 0, &priv->pinctrl_list);
 	if (res)
 		goto err;
 
@@ -387,6 +403,11 @@ stm32mp1_pwr_irq_probe(const void *fdt, int node,
 
 	if (IS_ENABLED(CFG_CORE_ASYNC_NOTIF))
 		notif_register_driver(&stm32_pwr_notif);
+
+	res = dt_driver_register_provider(fdt, node, NULL,
+					  NULL, DT_DRIVER_NOTYPE);
+	if (res)
+		panic("Can't register provider");
 
 	VERBOSE_PWR("Init pwr irq done");
 
@@ -430,8 +451,18 @@ stm32mp1_pwr_irq_user_dt_probe(const void *fdt, int node,
 	const fdt32_t *cuint = NULL;
 	size_t it = 0;
 	uint32_t *it_id = NULL;
+	int len = 0;
+	uint32_t phandle = 0;
 
 	VERBOSE_PWR("Init pwr irq user");
+
+	cuint = fdt_getprop(fdt, node, "wakeup-parent", &len);
+	if (!cuint || len != sizeof(uint32_t))
+		panic("Missing wakeup-parent");
+
+	phandle = fdt32_to_cpu(*cuint);
+	if (!dt_driver_get_provider_by_phandle(phandle, DT_DRIVER_NOTYPE))
+		return TEE_ERROR_DEFER_DRIVER_INIT;
 
 	cuint = fdt_getprop(fdt, node, "st,wakeup-pin-number", NULL);
 	if (!cuint)
@@ -462,6 +493,7 @@ stm32mp1_pwr_irq_user_dt_probe(const void *fdt, int node,
 
 static const struct dt_device_match pwr_irq_test_match_table[] = {
 	{ .compatible = "st,stm32mp1,pwr-irq-user" },
+	{ .compatible = "st,stm32mp1-pwr-irq-user" },
 	{ }
 };
 

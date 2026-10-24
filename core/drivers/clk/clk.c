@@ -230,8 +230,8 @@ struct clk *clk_get_parent(struct clk *clk)
 	return clk->parent;
 }
 
-static TEE_Result clk_get_parent_idx(struct clk *clk, struct clk *parent,
-				     size_t *pidx)
+TEE_Result clk_get_parent_idx(struct clk *clk, struct clk *parent,
+			      size_t *pidx)
 {
 	size_t i = 0;
 
@@ -315,6 +315,24 @@ out:
 	cpu_spin_unlock_xrestore(&clk_lock, exceptions);
 
 	return res;
+}
+
+TEE_Result clk_get_rates_array(struct clk *clk, size_t start_index,
+			       unsigned long *rates, size_t *nb_elts)
+{
+	if (!clk->ops->get_rates_array)
+		return TEE_ERROR_NOT_SUPPORTED;
+
+	return clk->ops->get_rates_array(clk, start_index, rates, nb_elts);
+}
+
+TEE_Result clk_get_rates_steps(struct clk *clk, unsigned long *min,
+			       unsigned long *max, unsigned long *step)
+{
+	if (!clk->ops->get_rates_steps)
+		return TEE_ERROR_NOT_SUPPORTED;
+
+	return clk->ops->get_rates_steps(clk, min, max, step);
 }
 
 static void clk_init_rate_req(struct clk *clk,
@@ -425,20 +443,31 @@ TEE_Result clk_set_rate(struct clk *clk, unsigned long rate)
 	return res;
 }
 
-TEE_Result clk_get_duty_cyle(struct clk *clk, struct clk_duty *duty)
+TEE_Result clk_get_duty_cycle(struct clk *clk, struct clk_duty *duty)
 {
 	if (clk->ops->get_duty_cycle)
 		return clk->ops->get_duty_cycle(clk, duty);
 
-	return TEE_ERROR_GENERIC;
+	if (clk->parent && (clk->flags & CLK_DUTY_CYCLE_PARENT))
+		return clk_get_duty_cycle(clk->parent, duty);
+
+	duty->num = 1;
+	duty->den = 2;
+
+	return TEE_SUCCESS;
 }
 
 unsigned long clk_round_rate(struct clk *clk, unsigned long rate)
 {
+	struct clk *parent = clk->parent;
+
 	if (clk->ops->round_rate)
 		return clk->ops->round_rate(clk, rate, clk->parent->rate);
 
-	return TEE_ERROR_GENERIC;
+	if (parent && (clk->flags & CLK_SET_RATE_PARENT))
+		return clk_round_rate(parent, rate);
+
+	return clk->rate;
 }
 
 #include <stdio.h>
@@ -495,3 +524,33 @@ void clk_summary(void)
 		clk_stm32_tree(clk, 0);
 	}
 }
+
+#ifdef CFG_PM
+TEE_Result clk_save_context(void)
+{
+	struct clk *clk = NULL;
+	TEE_Result res = TEE_ERROR_GENERIC;
+
+	STAILQ_FOREACH(clk, &clock_list, link) {
+		if (clk->ops && clk->ops->save_context) {
+			res = clk->ops->save_context(clk);
+			if (res) {
+				EMSG("Failed to save context of %s", clk->name);
+				return res;
+			}
+		}
+	}
+
+	return TEE_SUCCESS;
+}
+
+void clk_restore_context(void)
+{
+	struct clk *clk = NULL;
+
+	STAILQ_FOREACH(clk, &clock_list, link) {
+		if (clk->ops && clk->ops->restore_context)
+			clk->ops->restore_context(clk);
+	}
+}
+#endif

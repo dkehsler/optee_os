@@ -3,10 +3,16 @@
  * Copyright (c) 2018-2022, STMicroelectronics - All Rights Reserved
  *
  */
+#ifdef CFG_ARM64_core
+#include <arm64.h>
+#else
 #include <arm32.h>
+#endif /* CFG_ARM64_core */
+#include <config.h>
 #include <drivers/clk.h>
 #include <drivers/clk_dt.h>
 #include <drivers/stm32_rtc.h>
+#include <drivers/stm32_rif.h>
 #include <initcall.h>
 #include <io.h>
 #include <kernel/boot.h>
@@ -42,6 +48,7 @@
 #define RTC_SR				U(0x50)
 #define RTC_SCR				U(0x5C)
 #define RTC_OR				U(0x60)
+#define RTC_CIDCFGR(x)			(U(0x80) + U(0x4) * (x))
 
 #define RTC_TR_SU_MASK			GENMASK_32(3, 0)
 #define RTC_TR_ST_MASK			GENMASK_32(6, 4)
@@ -97,6 +104,11 @@
 #define RTC_WPR_KEY2			U(0x53)
 #define RTC_WPR_KEY_LOCK		U(0xFF)
 
+#define RTC_CIDCFGR_SCID_MASK		GENMASK_32(6, 4)
+#define RTC_CIDCFGR_SCID_MASK_SHIFT	U(4)
+#define RTC_CIDCFGR_CONF_MASK		(_CIDCFGR_CFEN |	 \
+					 RTC_CIDCFGR_SCID_MASK)
+
 #define RTC_PRIVCFGR_FULL_PRIV		BIT(15)
 #define RTC_PRIVCFGR_VALUES		GENMASK_32(3, 0)
 #define RTC_PRIVCFGR_VALUES_TO_SHIFT	GENMASK_32(5, 4)
@@ -110,13 +122,30 @@
 #define RTC_SECCFGR_TS_SEC		BIT(3)
 #define RTC_SECCFGR_MASK		(GENMASK_32(14, 13) | GENMASK_32(3, 0))
 
+#define RTC_RES_TIMESTAMP		U(3)
+
 #define RTC_FLAGS_READ_TWICE		BIT(0)
 #define RTC_FLAGS_SECURE		BIT(1)
 
 #define TIMEOUT_US_RTC_SHADOW		U(10000)
+#define MS_PER_SEC			U(1000)
+
+/*
+ * RIF miscellaneous
+ */
+
+#define RTC_NB_RIF_RESOURCES		U(6)
+
+#define RTC_RIF_FULL_PRIVILEGED		U(0x3F)
+#define RTC_RIF_FULL_SECURED		U(0x3F)
+
+#define RTC_NB_MAX_CID_SUPPORTED	U(7)
+
+#define RTC_CID_1			U(1)
 
 struct rtc_compat {
 	bool has_seccfgr;
+	bool has_rif_support;
 };
 
 struct rtc_device {
@@ -124,6 +153,8 @@ struct rtc_device {
 	struct rtc_compat compat;
 	struct clk *pclk;
 	struct clk *rtc_ck;
+	struct rif_conf_data conf_data;
+	unsigned int nb_res;
 	uint8_t flags;
 };
 
@@ -227,9 +258,16 @@ static void stm32_rtc_read_timestamp(struct stm32_rtc_time *time)
 	stm32_rtc_get_date(&cal_tamp, time);
 }
 
-void stm32_rtc_get_calendar(struct stm32_rtc_calendar *calendar)
+TEE_Result stm32_rtc_get_calendar(struct stm32_rtc_calendar *calendar)
 {
-	clk_enable(rtc_dev.pclk);
+	TEE_Result res = TEE_ERROR_GENERIC;
+
+	if (!rtc_dev.pclk)
+		return TEE_ERROR_GENERIC;
+
+	res = clk_enable(rtc_dev.pclk);
+	if (res)
+		return res;
 
 	stm32_rtc_read_calendar(calendar);
 
@@ -244,29 +282,58 @@ void stm32_rtc_get_calendar(struct stm32_rtc_calendar *calendar)
 	}
 
 	clk_disable(rtc_dev.pclk);
+
+	return TEE_SUCCESS;
 }
 
-/* Return difference in milliseconds on second fraction */
-static uint32_t stm32_rtc_get_second_fraction(struct stm32_rtc_calendar *cal)
+/*
+ * Get the subsecond value.
+ *
+ * Subsecond is a counter that grows from 0 to stm32_rtc_get_subsecond_scale()
+ * every second.
+ */
+static uint32_t stm32_rtc_get_subsecond(struct stm32_rtc_calendar *cal)
 {
 	uint32_t prediv_s = io_read32(get_base() + RTC_PRER) &
 			    RTC_PRER_PREDIV_S_MASK;
 	uint32_t ss = cal->ssr & RTC_SSR_SS_MASK;
 
-	return ((prediv_s - ss) * 1000) / (prediv_s + 1);
+	return prediv_s - ss;
 }
 
-/* Return absolute difference in milliseconds on second fraction */
-static signed long long stm32_rtc_diff_frac(struct stm32_rtc_calendar *cur,
-					    struct stm32_rtc_calendar *ref)
+/*
+ * Get the subsecond scale.
+ *
+ * Number of subseconds in a second is linked to RTC PREDIV_S value.
+ * The more PREDIV_S will be high, the more subseconds will be precise.
+ */
+static uint32_t stm32_rtc_get_subsecond_scale(void)
 {
-	return (signed long long)stm32_rtc_get_second_fraction(cur) -
-	       (signed long long)stm32_rtc_get_second_fraction(ref);
+	return (io_read32(get_base() + RTC_PRER) & RTC_PRER_PREDIV_S_MASK) + 1;
+}
+
+/* Return relative difference of ticks count between two rtc calendar */
+static signed long long
+stm32_rtc_diff_subs_tick(struct stm32_rtc_calendar *cur,
+			 struct stm32_rtc_calendar *ref,
+			 unsigned long tick_rate)
+{
+	return (((signed long long)stm32_rtc_get_subsecond(cur) -
+		 (signed long long)stm32_rtc_get_subsecond(ref)) *
+		(signed long long)tick_rate) /
+		stm32_rtc_get_subsecond_scale();
+}
+
+/* Return relative difference in milliseconds on subsecond */
+static signed long long stm32_rtc_diff_subs_ms(struct stm32_rtc_calendar *cur,
+					       struct stm32_rtc_calendar *ref)
+{
+	return stm32_rtc_diff_subs_tick(cur, ref, MS_PER_SEC);
 }
 
 /* Return absolute difference in milliseconds on seconds-in-day fraction */
-static signed long long stm32_rtc_diff_time(struct stm32_rtc_time *current,
-					    struct stm32_rtc_time *ref)
+static signed long long stm32_rtc_diff_time_ms(struct stm32_rtc_time *current,
+					       struct stm32_rtc_time *ref)
 {
 	signed long long curr_s = 0;
 	signed long long ref_s = 0;
@@ -289,8 +356,8 @@ static bool stm32_is_a_leap_year(uint32_t year)
 }
 
 /* Return absolute difference in milliseconds on day-in-year fraction */
-static signed long long stm32_rtc_diff_date(struct stm32_rtc_time *current,
-					    struct stm32_rtc_time *ref)
+static signed long long stm32_rtc_diff_date_ms(struct stm32_rtc_time *current,
+					       struct stm32_rtc_time *ref)
 {
 	uint32_t diff_in_days = 0;
 	uint32_t m = 0;
@@ -353,8 +420,12 @@ static signed long long stm32_rtc_diff_date(struct stm32_rtc_time *current,
 	return (24 * 60 * 60 * 1000) * (signed long long)diff_in_days;
 }
 
-unsigned long long stm32_rtc_diff_calendar(struct stm32_rtc_calendar *cur,
-					   struct stm32_rtc_calendar *ref)
+/*
+ * Return time diff in milliseconds between current and reference time
+ * System will panic if stm32_rtc_calendar "cur" is older than "ref".
+ */
+unsigned long long stm32_rtc_diff_calendar_ms(struct stm32_rtc_calendar *cur,
+					      struct stm32_rtc_calendar *ref)
 {
 	signed long long diff_in_ms = 0;
 	struct stm32_rtc_time curr_t = { };
@@ -365,18 +436,56 @@ unsigned long long stm32_rtc_diff_calendar(struct stm32_rtc_calendar *cur,
 	stm32_rtc_get_time(cur, &curr_t);
 	stm32_rtc_get_time(ref, &ref_t);
 
-	diff_in_ms += stm32_rtc_diff_frac(cur, ref);
-	diff_in_ms += stm32_rtc_diff_time(&curr_t, &ref_t);
-	diff_in_ms += stm32_rtc_diff_date(&curr_t, &ref_t);
+	diff_in_ms += stm32_rtc_diff_subs_ms(cur, ref);
+	diff_in_ms += stm32_rtc_diff_time_ms(&curr_t, &ref_t);
+	diff_in_ms += stm32_rtc_diff_date_ms(&curr_t, &ref_t);
+
+	if (diff_in_ms < 0)
+		panic("Negative time difference is not allowed");
 
 	return (unsigned long long)diff_in_ms;
 }
 
-void stm32_rtc_get_timestamp(struct stm32_rtc_time *tamp_ts)
+/*
+ * Return time diff in tick count between current and reference time
+ * System will panic if stm32_rtc_calendar "cur" is older than "ref".
+ */
+unsigned long long stm32_rtc_diff_calendar_tick(struct stm32_rtc_calendar *cur,
+						struct stm32_rtc_calendar *ref,
+						unsigned long tick_rate)
 {
+	signed long long diff_in_tick = 0;
+	struct stm32_rtc_time curr_t = { };
+	struct stm32_rtc_time ref_t = { };
+
+	stm32_rtc_get_date(cur, &curr_t);
+	stm32_rtc_get_date(ref, &ref_t);
+	stm32_rtc_get_time(cur, &curr_t);
+	stm32_rtc_get_time(ref, &ref_t);
+
+	diff_in_tick += stm32_rtc_diff_subs_tick(cur, ref, tick_rate);
+	diff_in_tick += stm32_rtc_diff_time_ms(&curr_t, &ref_t) *
+			tick_rate / MS_PER_SEC;
+	diff_in_tick += stm32_rtc_diff_date_ms(&curr_t, &ref_t) *
+			tick_rate / MS_PER_SEC;
+
+	if (diff_in_tick < 0)
+		panic("Negative time difference is not allowed");
+
+	return (unsigned long long)diff_in_tick;
+}
+
+TEE_Result stm32_rtc_get_timestamp(struct stm32_rtc_time *tamp_ts)
+{
+	TEE_Result res = TEE_ERROR_GENERIC;
 	vaddr_t rtc_base = get_base();
 
-	clk_enable(rtc_dev.pclk);
+	if (!rtc_dev.pclk)
+		return TEE_ERROR_GENERIC;
+
+	res = clk_enable(rtc_dev.pclk);
+	if (res)
+		return res;
 
 	if (io_read32(rtc_base + RTC_SR) & RTC_SR_TSF) {
 		/* Timestamp for tamper event */
@@ -389,13 +498,21 @@ void stm32_rtc_get_timestamp(struct stm32_rtc_time *tamp_ts)
 	}
 
 	clk_disable(rtc_dev.pclk);
+
+	return TEE_SUCCESS;
 }
 
-void stm32_rtc_set_tamper_timestamp(void)
+TEE_Result stm32_rtc_set_tamper_timestamp(void)
 {
+	TEE_Result res = TEE_ERROR_GENERIC;
 	vaddr_t rtc_base = get_base();
 
-	clk_enable(rtc_dev.pclk);
+	if (!rtc_dev.pclk)
+		return TEE_ERROR_GENERIC;
+
+	res = clk_enable(rtc_dev.pclk);
+	if (res)
+		return res;
 
 	stm32_rtc_write_unprotect();
 
@@ -413,6 +530,8 @@ void stm32_rtc_set_tamper_timestamp(void)
 	stm32_rtc_write_protect();
 
 	clk_disable(rtc_dev.pclk);
+
+	return TEE_SUCCESS;
 }
 
 TEE_Result stm32_rtc_is_timestamp_enable(bool *ret)
@@ -433,11 +552,124 @@ TEE_Result stm32_rtc_is_timestamp_enable(bool *ret)
 	return TEE_SUCCESS;
 }
 
-static TEE_Result parse_dt(const void *fdt, int node,
-			   const void *compat_data)
+TEE_Result stm32_rtc_driver_is_initialized(void)
+{
+	if (rtc_dev.pclk)
+		return TEE_SUCCESS;
+
+	return TEE_ERROR_DEFER_DRIVER_INIT;
+}
+
+static TEE_Result check_rif_config(void)
+{
+	uint32_t rxcidcfgr = io_read32(get_base() +
+				       RTC_CIDCFGR(RTC_RES_TIMESTAMP));
+	uint32_t cid = (rxcidcfgr & RTC_CIDCFGR_SCID_MASK) >>
+		       RTC_CIDCFGR_SCID_MASK_SHIFT;
+
+	/* Check if TAMPTS is available for our CID */
+	if ((rxcidcfgr & _CIDCFGR_CFEN) && (cid != RTC_CID_1))
+		return TEE_ERROR_ACCESS_DENIED;
+
+	return TEE_SUCCESS;
+}
+
+static void apply_rif_config(bool is_tdcid)
+{
+	vaddr_t base = get_base();
+	unsigned int shifted_values = 0;
+	uint32_t seccfgr = 0;
+	uint32_t privcfgr = 0;
+	uint32_t access_mask_reg = 0;
+	unsigned int i = 0;
+
+	/* Build access mask for RTC_SECCFGR and RTC_PRIVCFGR */
+	for (i = 0; i < RTC_NB_RIF_RESOURCES; i++) {
+		if (rtc_dev.conf_data.access_mask[0] & BIT(i)) {
+			if (i <= RTC_RES_TIMESTAMP)
+				access_mask_reg |= BIT(i);
+			else
+				access_mask_reg |= BIT(i) << RTC_SECCFGR_SHIFT;
+		}
+	}
+
+	for (i = 0; i < RTC_NB_RIF_RESOURCES; i++) {
+		if (!(BIT(i) & rtc_dev.conf_data.access_mask[0]))
+			continue;
+
+		/*
+		 * When TDCID, OP-TEE should be the one to set the CID filtering
+		 * configuration. Clearing previous configuration prevents
+		 * undesired events during the only legitimate configuration.
+		 */
+		if (is_tdcid)
+			io_clrbits32(base + RTC_CIDCFGR(i),
+				     RTC_CIDCFGR_CONF_MASK);
+	}
+
+	/* Security RIF configuration */
+	seccfgr = rtc_dev.conf_data.sec_conf[0];
+
+	/* Check if all resources must be secured */
+	if (seccfgr == RTC_RIF_FULL_SECURED) {
+		io_setbits32(base + RTC_SECCFGR, RTC_SECCFGR_FULL_SEC);
+
+		if (!(io_read32(base + RTC_SECCFGR) & RTC_SECCFGR_FULL_SEC))
+			panic("Bad RTC seccfgr configuration");
+	}
+
+	/* Shift some values to align with the register */
+	shifted_values = (seccfgr & RTC_SECCFGR_VALUES_TO_SHIFT) <<
+			 RTC_SECCFGR_SHIFT;
+	seccfgr = (seccfgr & RTC_SECCFGR_VALUES) + shifted_values;
+
+	io_clrsetbits32(base + RTC_SECCFGR,
+			RTC_SECCFGR_MASK & access_mask_reg, seccfgr);
+
+	/* Privilege RIF configuration */
+	privcfgr = rtc_dev.conf_data.priv_conf[0];
+
+	/* Check if all resources must be privileged */
+	if (privcfgr == RTC_RIF_FULL_PRIVILEGED) {
+		io_setbits32(base + RTC_PRIVCFGR, RTC_PRIVCFGR_FULL_PRIV);
+
+		if (!(io_read32(base + RTC_PRIVCFGR) & RTC_PRIVCFGR_FULL_PRIV))
+			panic("Bad RTC privcfgr configuration");
+	}
+
+	/* Shift some values to align with the register */
+	shifted_values = (privcfgr & RTC_PRIVCFGR_VALUES_TO_SHIFT) <<
+			 RTC_PRIVCFGR_SHIFT;
+	privcfgr = (privcfgr & RTC_PRIVCFGR_VALUES) + shifted_values;
+
+	io_clrsetbits32(base + RTC_PRIVCFGR,
+			RTC_PRIVCFGR_MASK & access_mask_reg, privcfgr);
+
+	if (!is_tdcid)
+		return;
+
+	for (i = 0; i < RTC_NB_RIF_RESOURCES; i++) {
+		if (!(BIT(i) & rtc_dev.conf_data.access_mask[0]))
+			continue;
+		/*
+		 * When at least one resource has CID filtering enabled,
+		 * the RTC_PRIVCFGR_FULL_PRIV and RTC_SECCFGR_FULL_SEC bits are
+		 * cleared.
+		 */
+		io_clrsetbits32(base + RTC_CIDCFGR(i),
+				RTC_CIDCFGR_CONF_MASK,
+				rtc_dev.conf_data.cid_confs[i]);
+	}
+}
+
+static TEE_Result parse_dt(const void *fdt, int node, const void *compat_data)
 {
 	TEE_Result res = TEE_ERROR_GENERIC;
 	struct dt_node_info dt_info = { };
+	const fdt32_t *cuint = NULL;
+	uint32_t rif_conf = 0;
+	unsigned int i = 0;
+	int lenp = 0;
 
 	_fdt_fill_device_info(fdt, &dt_info, node);
 
@@ -456,6 +688,35 @@ static TEE_Result parse_dt(const void *fdt, int node,
 
 	rtc_dev.compat = *(struct rtc_compat *)compat_data;
 
+	if (!rtc_dev.compat.has_rif_support)
+		return res;
+
+	cuint = fdt_getprop(fdt, node, "st,protreg", &lenp);
+	if (!cuint)
+		panic("No RIF configuration available");
+
+	rtc_dev.nb_res = (unsigned int)(lenp / sizeof(uint32_t));
+	assert(rtc_dev.nb_res <= RTC_NB_RIF_RESOURCES);
+
+	rtc_dev.conf_data.cid_confs = calloc(RTC_NB_RIF_RESOURCES,
+					     sizeof(uint32_t));
+	rtc_dev.conf_data.sec_conf = calloc(1, sizeof(uint32_t));
+	rtc_dev.conf_data.priv_conf = calloc(1, sizeof(uint32_t));
+	rtc_dev.conf_data.access_mask = calloc(1, sizeof(uint32_t));
+	if (!rtc_dev.conf_data.cid_confs ||
+	    !rtc_dev.conf_data.sec_conf ||
+	    !rtc_dev.conf_data.priv_conf ||
+	    !rtc_dev.conf_data.access_mask)
+		panic("Not enough memory capacity for RTC RIF config");
+
+	for (i = 0; i < rtc_dev.nb_res; i++) {
+		rif_conf = fdt32_to_cpu(cuint[i]);
+
+		stm32_rif_parse_cfg(rif_conf, &rtc_dev.conf_data,
+				    RTC_NB_MAX_CID_SUPPORTED,
+				    RTC_NB_RIF_RESOURCES);
+	}
+
 	return TEE_SUCCESS;
 }
 
@@ -463,6 +724,13 @@ static TEE_Result stm32_rtc_probe(const void *fdt, int node,
 				  const void *compat_data)
 {
 	TEE_Result res = TEE_ERROR_GENERIC;
+	bool is_tdcid = false;
+
+	if (rtc_dev.compat.has_rif_support) {
+		res = stm32_rifsc_check_tdcid(&is_tdcid);
+		if (res)
+			return res;
+	}
 
 	res = parse_dt(fdt, node, compat_data);
 	if (res) {
@@ -478,18 +746,47 @@ static TEE_Result stm32_rtc_probe(const void *fdt, int node,
 	if (clk_get_rate(rtc_dev.pclk) < (clk_get_rate(rtc_dev.rtc_ck) * 7))
 		rtc_dev.flags |= RTC_FLAGS_READ_TWICE;
 
+	if (rtc_dev.compat.has_rif_support) {
+		res = clk_enable(rtc_dev.pclk);
+		if (res)
+			return res;
+
+		apply_rif_config(is_tdcid);
+
+		/*
+		 * Verify if applied RIF config will not disable
+		 * other functionnalities of this driver.
+		 */
+		res = check_rif_config();
+		if (res)
+			panic("Incompatible RTC RIF configuration");
+
+		clk_disable(rtc_dev.pclk);
+	}
+
 	return res;
 }
 
+static struct rtc_compat mp25_compat = {
+	.has_seccfgr = true,
+	.has_rif_support = true,
+};
+
 static struct rtc_compat mp15_compat = {
 	.has_seccfgr = false,
+	.has_rif_support = false,
 };
 
 static struct rtc_compat mp13_compat = {
 	.has_seccfgr = true,
+	.has_rif_support = false,
 };
 
 static const struct dt_device_match stm32_rtc_match_table[] = {
+	{
+		.compatible = "st,stm32mp25-rtc",
+		.compat_data = &mp25_compat,
+	},
 	{
 		.compatible = "st,stm32mp1-rtc",
 		.compat_data = &mp15_compat,

@@ -35,9 +35,6 @@ vaddr_t stm32mp_bkpsram_base(void);
 /* Platform util for the STGEN driver */
 vaddr_t stm32mp_stgen_base(void);
 
-/* Platform util for the GIC */
-void stm32mp_gic_set_end_of_interrupt(uint32_t it);
-
 /* Get device ID from SYSCFG registers */
 uint32_t stm32mp_syscfg_get_chip_dev_id(void);
 
@@ -64,6 +61,22 @@ static inline void stm32mp_dump_core_registers(bool panicking __unused) { }
 
 /* Platform util for PMIC support */
 bool stm32mp_with_pmic(void);
+
+/**
+ * stm32_reconfigure_region() - Allows to reconfigure a memory region.
+ * @fdt:	Device tree file to work on
+ * @phandle:	Phandle of the memory region
+ * @cfg:	When @cfg points to a NULL reference, the function grants
+ *		access to OP-TEE compartment and returns in @cfg a pointer
+ *		to the previously applied configuration, to be later used in a
+ *		call to the same API function.
+ *		When @cfg points to a non-NULL reference, that reference is
+ *		expected to be obtained from a previous call to this function
+ *		and contains the configuration to be applied. In such case, the
+ *		function sets @cfg output value to a NULL reference.
+ */
+TEE_Result stm32_reconfigure_region(const void *fdt, int phandle,
+				    const void **cfg);
 
 /* Power management service */
 #ifdef CFG_PSCI_ARM32
@@ -258,20 +271,8 @@ static inline bool stm32mp_gpio_bank_is_non_secure(unsigned int bank __unused)
 
 #endif /* CFG_STM32MP1_SHARED_RESOURCES */
 
-/*
- * CPU operating point
- */
+void __noreturn do_reset(const char *str);
 
-/* Return the number of CPU operating points */
-size_t stm32mp1_cpu_opp_count(void);
-
-/* Get level value identifying CPU operating point @opp_index */
-unsigned int stm32mp1_cpu_opp_level(size_t opp_index);
-
-/* Request to switch to CPU operating point related to @level */
-TEE_Result stm32mp1_cpu_opp_set_level(unsigned int level);
-
-/* Get level related to current CPU operating point */
-TEE_Result stm32mp1_cpu_opp_read_level(unsigned int *level);
+TEE_Result stm32_activate_internal_tamper(int id);
 
 #endif /*__STM32_UTIL_H__*/

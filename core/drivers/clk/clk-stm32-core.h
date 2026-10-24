@@ -115,6 +115,7 @@ struct clk_stm32_gate_ready_cfg {
 #define NO_DIV		INT32_MAX
 #define NO_GATE		INT32_MAX
 
+void stm32_gate_endisable(uint16_t gate_id, bool enable);
 void stm32_gate_enable(uint16_t gate_id);
 void stm32_gate_disable(uint16_t gate_id);
 bool stm32_gate_is_enabled(uint16_t gate_id);
@@ -125,6 +126,7 @@ TEE_Result stm32_gate_rdy_disable(uint16_t gate_id);
 size_t stm32_mux_get_parent(uint32_t mux_id);
 TEE_Result stm32_mux_set_parent(uint16_t pid, uint8_t sel);
 
+unsigned long stm32_div_get_rate(int div_id, unsigned long prate);
 TEE_Result stm32_div_set_rate(int div_id, unsigned long rate,
 			      unsigned long prate);
 
@@ -133,6 +135,12 @@ TEE_Result stm32_div_set_value(uint32_t div_id, uint32_t value);
 
 int fdt_clk_stm32_parse_by_name(const void *fdt, int node, const char *name,
 				uint32_t *tab, uint32_t *nb);
+
+TEE_Result clk_stm32_gate_ready_enable(struct clk *clk);
+void clk_stm32_gate_ready_disable(struct clk *clk);
+TEE_Result clk_stm32_gate_enable(struct clk *clk);
+void clk_stm32_gate_disable(struct clk *clk);
+bool clk_stm32_gate_is_enabled(struct clk *clk);
 
 unsigned long clk_stm32_divider_get_rate(struct clk *clk,
 					 unsigned long parent_rate);
@@ -160,6 +168,8 @@ extern const struct clk_ops clk_stm32_gate_ready_ops;
 extern const struct clk_ops clk_stm32_divider_ops;
 extern const struct clk_ops clk_stm32_mux_ops;
 extern const struct clk_ops clk_stm32_composite_ops;
+
+extern const struct clk_ops clk_stm32_gate_pm_ops;
 
 #define PARENT(x...) { x }
 
@@ -248,6 +258,18 @@ extern const struct clk_ops clk_stm32_composite_ops;
 		.flags = (_flags),\
 		.num_parents = (_nb_parents),\
 		.parents = _parents,\
+	}
+
+#define STM32_GATE_PM(_name, _parent, _flags, _gate_id)\
+	struct clk _name = {\
+		.ops = &clk_stm32_gate_pm_ops,\
+		.priv = &(struct clk_stm32_gate_cfg) {\
+			.gate_id = _gate_id,\
+		},\
+		.name = #_name,\
+		.flags = (_flags),\
+		.num_parents = 1,\
+		.parents = { (_parent) },\
 	}
 
 struct clk_stm32_priv *clk_stm32_get_priv(void);

@@ -7,17 +7,25 @@
 #include <boot_api.h>
 #include <config.h>
 #include <console.h>
+#include <drivers/clk_dt.h>
 #include <drivers/counter.h>
 #include <drivers/gic.h>
 #include <drivers/stm32_bsec.h>
 #include <drivers/stm32_etzpc.h>
 #include <drivers/stm32_firewall.h>
-#include <drivers/stm32_rtc.h>
 #include <drivers/stm32_tamp.h>
 #include <drivers/stm32_uart.h>
 #include <drivers/stm32mp_dt_bindings.h>
+#include <drivers/stm32mp1_pwr.h>
+#ifdef CFG_STM32MP15
+#include <drivers/stm32mp1_rcc.h>
+#endif
+#ifdef CFG_STM32MP13
+#include <drivers/stm32mp13_rcc.h>
+#endif
 #include <io.h>
 #include <kernel/boot.h>
+#include <kernel/delay.h>
 #include <kernel/dt.h>
 #include <kernel/interrupt.h>
 #include <kernel/misc.h>
@@ -28,6 +36,7 @@
 #include <sm/psci.h>
 #include <stm32_util.h>
 #include <trace.h>
+#include <util.h>
 
 register_phys_mem_pgdir(MEM_AREA_IO_NSEC, APB1_BASE, APB1_SIZE);
 register_phys_mem_pgdir(MEM_AREA_IO_NSEC, APB2_BASE, APB2_SIZE);
@@ -67,6 +76,24 @@ register_phys_mem(MEM_AREA_IO_SEC, MCUSRAM_BASE, MCUSRAM_SIZE);
 #define _ID2STR(id)		(#id)
 #define ID2STR(id)		_ID2STR(id)
 
+/* Firewall configuration for secure privilege RW access only */
+static const struct stm32_firewall_cfg sec_cfg[] = {
+	{ FWLL_SEC_RW | FWLL_MASTER(0) },
+	{ }, /* Null terminated */
+};
+
+/* Firewall configuration for Cortex-M unsecure RW access only */
+static const struct stm32_firewall_cfg mcu_cfg[] = {
+	{ FWLL_NSEC_UNPRIV_RW | FWLL_MASTER(1) },
+	{ }, /* Null terminated */
+};
+
+/* Firewall configuration for shared resources */
+static const struct stm32_firewall_cfg shared_cfg[] = {
+	{ FWLL_NSEC_RW | FWLL_MASTER(0) },
+	{ }, /* Null terminated */
+};
+
 static TEE_Result platform_banner(void)
 {
 #ifdef CFG_EMBED_DTB
@@ -77,6 +104,7 @@ static TEE_Result platform_banner(void)
 	IMSG("Platform stm32mp1: flavor %s - no device tree",
 		ID2STR(PLATFORM_FLAVOR));
 #endif
+	IMSG("OP-TEE ST profile: %s", TO_STR(CFG_STM32MP_PROFILE));
 
 	return TEE_SUCCESS;
 }
@@ -273,10 +301,6 @@ DECLARE_KEEP_PAGER(sgi9_reset_handler);
 static TEE_Result init_stm32mp1_drivers(void)
 {
 	TEE_Result res = TEE_ERROR_GENERIC;
-	const struct stm32_firewall_cfg sec_cfg[] = {
-		{ FWLL_SEC_RW | FWLL_MASTER(0) },
-		{ }, /* Null terminated */
-	};
 
 	/* Without secure DTB support, some drivers must be inited */
 	if (!IS_ENABLED(CFG_EMBED_DTB))
@@ -445,7 +469,6 @@ void __noreturn plat_panic(void)
 		cpu_idle();
 }
 
-#ifdef CFG_TEE_CORE_DEBUG
 static TEE_Result init_debug(void)
 {
 	TEE_Result res = TEE_SUCCESS;
@@ -458,10 +481,14 @@ static TEE_Result init_debug(void)
 		return res;
 
 	if (state != BSEC_STATE_SEC_CLOSED && conf) {
+#ifdef CFG_TEE_CORE_DEBUG
 		if (IS_ENABLED(CFG_WARN_INSECURE))
 			IMSG("WARNING: All debug access are allowed");
 
 		res = stm32_bsec_write_debug_conf(conf | BSEC_DEBUG_ALL);
+#else
+		res = stm32_bsec_write_debug_conf(conf | BSEC_DBGSWGEN);
+#endif
 
 		/* Enable DBG as used to access coprocessor debug registers */
 		clk_enable(dbg_clk);
@@ -470,7 +497,6 @@ static TEE_Result init_debug(void)
 	return res;
 }
 early_init_late(init_debug);
-#endif
 
 static int get_chip_dev_id(uint32_t *dev_id)
 {
@@ -526,15 +552,6 @@ bool stm32mp_supports_cpu_opp(uint32_t opp_id)
 		panic();
 	}
 
-	switch (opp_id) {
-	case PLAT_OPP_ID1:
-	case PLAT_OPP_ID2:
-		id = opp_id;
-		break;
-	default:
-		return false;
-	}
-
 	switch (part_number) {
 #ifdef CFG_STM32MP13
 	case STM32MP135F_PART_NB:
@@ -552,10 +569,14 @@ bool stm32mp_supports_cpu_opp(uint32_t opp_id)
 	case STM32MP151F_PART_NB:
 	case STM32MP151D_PART_NB:
 #endif
-		return true;
+		id = BIT(1);
+		break;
 	default:
-		return id == PLAT_OPP_ID1;
+		id = BIT(0);
+		break;
 	}
+
+	return (opp_id & id) == id;
 }
 
 bool stm32mp_supports_hw_cryp(void)
@@ -636,25 +657,37 @@ DECLARE_KEEP_PAGER(stm32_hse_over_frequency);
 
 static TEE_Result stm32_hse_monitoring(void)
 {
-	struct clk *hse_clk = stm32mp_rcc_clock_id_to_clk(CK_HSE);
-	struct clk *hsi_clk = stm32mp_rcc_clock_id_to_clk(CK_HSI);
+	struct counter_device *counter = NULL;
+	struct clk *hse_clk = NULL;
+	struct clk *hsi_clk = NULL;
 	unsigned long hse = 0;
 	unsigned long hsi_cal = 0;
-	struct counter_device *counter;
 	uint32_t ticks = 0;
 	void *fdt = NULL;
 	void *config = NULL;
-	int node = 0;
-
-	DMSG("HSE monitoring");
+	int node = -1;
+	TEE_Result res = TEE_ERROR_GENERIC;
 
 	fdt = get_embedded_dt();
+	if (!fdt)
+		panic();
+
 	node = fdt_node_offset_by_compatible(fdt, 0, FREQ_MONITOR_COMPAT);
+	if (node == -FDT_ERR_NOTFOUND)
+		return TEE_SUCCESS;
 	if (node < 0)
 		panic();
 
 	if (_fdt_get_status(fdt, node) == DT_STATUS_DISABLED)
 		return TEE_SUCCESS;
+
+	res = clk_dt_get_by_name(fdt, node, "hse", &hse_clk);
+	if  (res)
+		return res;
+
+	res = clk_dt_get_by_name(fdt, node, "hsi", &hsi_clk);
+	if  (res)
+		return res;
 
 	hse = clk_get_rate(hse_clk);
 	hsi_cal = clk_get_rate(hsi_clk);
@@ -684,108 +717,110 @@ static TEE_Result stm32_hse_monitoring(void)
 driver_init_late(stm32_hse_monitoring);
 #endif /* CFG_STM32_HSE_MONITORING */
 
-#ifdef CFG_STM32_TAMP
+void __noreturn do_reset(const char *str __maybe_unused)
+{
+	stm32mp_mask_timer();
+
+	if (stm32mp_supports_second_core()) {
+		uint32_t target_mask = 0;
+
+		if (get_core_pos() == 0)
+			target_mask = TARGET_CPU1_GIC_MASK;
+		else
+			target_mask = TARGET_CPU0_GIC_MASK;
+
+		itr_raise_sgi(GIC_SEC_SGI_1, target_mask);
+		/* wait than other core is halted */
+		mdelay(1);
+	}
+	IMSG("Forced system reset %s", str);
+	console_flush();
+	stm32_reset_system();
+	udelay(100);
+	panic();
+}
+
+/* Activate the SoC resources required by internal TAMPER */
+TEE_Result stm32_activate_internal_tamper(int id)
+{
+	TEE_Result res = TEE_ERROR_NOT_SUPPORTED;
+
+	switch (id) {
+	case INT_TAMP1: /* RTC/backup power domain voltage monitoring */
+	case INT_TAMP2: /* Temperature monitoring */
+		stm32mp_pwr_monitoring_enable();
+		res = TEE_SUCCESS;
+		break;
+
+	case INT_TAMP3: /* LSE monitoring (LSECSS) */
+		if (io_read32(stm32_rcc_base() + RCC_BDCR) & RCC_BDCR_LSECSSON)
+			res = TEE_SUCCESS;
+		break;
+
+	case INT_TAMP4: /* HSE monitoring (HSECSS) */
+		if (io_read32(stm32_rcc_base() + RCC_OCENSETR) &
+		    RCC_OCENR_HSECSSON)
+			res = TEE_SUCCESS;
+		break;
 
 #ifdef CFG_STM32MP13
-static const char * const itamper_name[] = {
-	[INT_TAMP1] = "Backup domain voltage threshold monitoring",
-	[INT_TAMP2] = "Temperature monitoring",
-	[INT_TAMP3] = "LSE monitoring",
-	[INT_TAMP4] = "HSE monitoring",
-	[INT_TAMP7] = "ADC2 analog watchdog monitoring 1",
-	[INT_TAMP12] = "ADC2 analog watchdog monitoring 2",
-	[INT_TAMP13] = "ADC2 analog watchdog monitoring 3",
-};
+	case INT_TAMP5:
+	case INT_TAMP6:
+	case INT_TAMP7:
+	case INT_TAMP8:
+	case INT_TAMP9:
+	case INT_TAMP10:
+	case INT_TAMP11:
+	case INT_TAMP12:
+	case INT_TAMP13:
+		res = TEE_SUCCESS;
+		break;
 #endif
-
 #ifdef CFG_STM32MP15
-static const char * const itamper_name[] = {
-	[INT_TAMP1] = "RTC power domain",
-	[INT_TAMP2] = "Temperature monitoring",
-	[INT_TAMP3] = "LSE monitoring",
-	[INT_TAMP4] = "HSE monitoring",
-};
-#endif
-DECLARE_KEEP_PAGER(itamper_name);
-
-static uint32_t __unused stm32mp1_itamper_action(int id)
-{
-	const char __maybe_unused *tamp_name = NULL;
-
-	if (id >= 0 && ((size_t)id < ARRAY_SIZE(itamper_name)))
-		tamp_name = itamper_name[id];
-
-	MSG("Internal tamper %u (%s) occurs", id - INT_TAMP1 + 1, tamp_name);
-
-	return TAMP_CB_ACK_AND_RESET;
-}
-DECLARE_KEEP_PAGER(stm32mp1_itamper_action);
-
-static uint32_t __unused stm32mp1_etamper_action(int id __maybe_unused)
-{
-	MSG("External tamper %u occurs", id - EXT_TAMP1 + 1);
-
-	return TAMP_CB_ACK_AND_RESET;
-}
-DECLARE_KEEP_PAGER(stm32mp1_etamper_action);
-
-static TEE_Result stm32_configure_tamp(void)
-{
-	TEE_Result res __maybe_unused = TEE_SUCCESS;
-	struct stm32_bkpregs_conf bkpregs_conf = {
-		.nb_zone1_regs = 10, /* 10 registers in zone 1 */
-		.nb_zone2_regs = 5   /* 5 registers in zone 2 */
-				     /* Zone3 all remaining */
-	};
-
-	/* Enable BKP Register protection */
-	if (stm32_tamp_set_secure_bkpregs(&bkpregs_conf))
-		panic();
-
-	/*
-	 * The stm32_tamp_activate_tamp() for INT_TAMPx returns an error code
-	 * only if INT_TAMPx doesn't exist on the SoC or if 'mode' is
-	 * incompatible. Here 'mode' is the simplest one, and we only activate
-	 * existing INT_TAMPx.
-	 */
-	stm32_tamp_activate_tamp(INT_TAMP1, TAMP_ERASE,
-				 stm32mp1_itamper_action);
-	stm32_tamp_activate_tamp(INT_TAMP2, TAMP_ERASE,
-				 stm32mp1_itamper_action);
-	stm32_tamp_activate_tamp(INT_TAMP3, TAMP_ERASE,
-				 stm32mp1_itamper_action);
-	stm32_tamp_activate_tamp(INT_TAMP4, TAMP_ERASE,
-				 stm32mp1_itamper_action);
-#ifdef CFG_STM32MP13
-	stm32_tamp_activate_tamp(INT_TAMP7, TAMP_ERASE,
-				 stm32mp1_itamper_action);
-	stm32_tamp_activate_tamp(INT_TAMP12, TAMP_ERASE,
-				 stm32mp1_itamper_action);
-	stm32_tamp_activate_tamp(INT_TAMP13, TAMP_ERASE,
-				 stm32mp1_itamper_action);
+	case INT_TAMP5:
+	case INT_TAMP8:
+		res = TEE_SUCCESS;
+		break;
 #endif
 
-#ifdef CFG_STM32MP13
-	/*
-	 * EXT_TAMPx needs to exist but also to be activated in DT. Here, we
-	 * check if the EXT_TAMP2 is defined in DT.
-	 */
-	res = stm32_tamp_activate_tamp(EXT_TAMP2, TAMP_ERASE,
-				       stm32mp1_etamper_action);
-	if (res == TEE_ERROR_BAD_PARAMETERS)
-		DMSG("no EXT_TAMP2 on this platform");
-	else if (res == TEE_ERROR_ITEM_NOT_FOUND)
-		DMSG("EXT_TAMP2 in pin was not found in device tree");
-#endif
+	default:
+		break;
+	}
 
-	if (stm32_tamp_set_config())
-		panic();
-
-	/* Enable timestamp for tamper */
-	stm32_rtc_set_tamper_timestamp();
-
-	return TEE_SUCCESS;
+	return res;
 }
 
-driver_init_late(stm32_configure_tamp);
-#endif /* CFG_STM32_TAMP */
+TEE_Result stm32_reconfigure_region(const void *fdt, int phandle,
+				    const void **cfg)
+{
+	int node = fdt_node_offset_by_phandle(fdt, phandle);
+	paddr_t reg_base = 0;
+	size_t reg_size = 0;
+
+	if (!cfg)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	if (node < 0) {
+		EMSG("Could not get node offset for mem region, res=%d", node);
+		return TEE_ERROR_GENERIC;
+	}
+
+	reg_base = _fdt_reg_base_address(fdt, node);
+	reg_size = _fdt_reg_size(fdt, node);
+	if (reg_base == DT_INFO_INVALID_REG ||
+	    reg_size == DT_INFO_INVALID_REG_SIZE)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	if (*cfg)
+		return stm32_firewall_set_config(reg_base, reg_size, *cfg);
+
+	/* Get secure access on the memory region */
+	if (!stm32_firewall_check_access(reg_base, reg_size, mcu_cfg))
+		*cfg = &mcu_cfg;
+	else if (!stm32_firewall_check_access(reg_base, reg_size, shared_cfg))
+		*cfg = &shared_cfg;
+	else
+		return TEE_ERROR_ACCESS_DENIED;
+
+	return stm32_firewall_set_config(reg_base, reg_size, sec_cfg);
+}

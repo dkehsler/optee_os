@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Copyright (c) 2017-2021, STMicroelectronics
+ * Copyright (c) 2017-2023, STMicroelectronics
  */
 
 #include <config.h>
@@ -9,10 +9,12 @@
 #include <drivers/regulator.h>
 #include <drivers/stm32_firewall.h>
 #include <drivers/stm32_i2c.h>
+#include <drivers/stm32mp_dt_bindings.h>
 #include <drivers/stm32mp1_pmic.h>
 #include <drivers/stm32mp1_pwr.h>
 #include <drivers/stpmic1.h>
 #include <drivers/stpmic1_regulator.h>
+#include <dt-bindings/mfd/st,stpmic1.h>
 #include <io.h>
 #include <keep.h>
 #include <kernel/boot.h>
@@ -30,6 +32,8 @@
 #include <trace.h>
 #include <util.h>
 
+#include "pm/power.h"
+
 #define MODE_STANDBY                    8
 
 #define PMIC_I2C_TRIALS			1
@@ -39,9 +43,36 @@
 
 #define PMIC_REGU_COUNT			14
 
+/*
+ * st,mask-reset: set mask reset for the regulator, meaning that the regulator
+ * setting is maintained during pmic reset.
+ */
+#define STPMIC1_REGUL_MASK_RESET	BIT(15)
+/* st,regulator-sink-source: set the regulator in sink source mode */
+#define STPMIC1_REGUL_SINK_SOURCE	BIT(14)
+/* st,regulator-bypass: set the regulator in bypass mode */
+#define STPMIC1_REGUL_ENABLE_BYPASS	BIT(13)
+
+/* suspend() arguments */
+#define STPMIC1_LP_STATE_OFF		BIT(0)
+#define STPMIC1_LP_STATE_ON		BIT(1)
+#define STPMIC1_LP_STATE_UNCHANGED	BIT(2)
+#define STPMIC1_LP_STATE_SET_VOLT	BIT(3)
+
 /* Expect a single PMIC instance */
 static struct i2c_handle_s *i2c_pmic_handle;
 static uint32_t pmic_i2c_addr;
+
+struct pmic_it_handle_s {
+	uint8_t pmic_reg;
+	uint8_t pmic_bit;
+	uint8_t notif_id;
+
+	SLIST_ENTRY(pmic_it_handle_s) link;
+};
+
+static SLIST_HEAD(pmic_it_handle_head, pmic_it_handle_s) pmic_it_handle_list =
+	SLIST_HEAD_INITIALIZER(pmic_it_handle_list);
 
 /* CPU voltage supplier if found */
 static char cpu_supply_name[PMIC_REGU_SUPPLY_NAME_LEN];
@@ -49,7 +80,8 @@ static char cpu_supply_name[PMIC_REGU_SUPPLY_NAME_LEN];
 /* Mutex for protecting PMIC accesses */
 static struct mutex pmic_mu = MUTEX_INITIALIZER;
 
-static TEE_Result register_pmic_regulator(const char *regu_name, int node);
+static TEE_Result register_pmic_regulator(const void *fdt,
+					  const char *regu_name, int node);
 
 static int dt_get_pmic_node(const void *fdt)
 {
@@ -145,7 +177,7 @@ static void parse_regulator_fdt_nodes(void)
 
 		assert(stpmic1_regulator_is_valid(regu_name));
 
-		if (register_pmic_regulator(regu_name, regu_node))
+		if (register_pmic_regulator(fdt, regu_name, regu_node))
 			panic();
 	}
 
@@ -266,13 +298,13 @@ static TEE_Result pmic_set_flag(const struct regul_desc *desc, uint16_t flag)
 	case REGUL_PULL_DOWN:
 		ret = stpmic1_regulator_pull_down_set(desc->node_name);
 		break;
-	case REGUL_MASK_RESET:
+	case STPMIC1_REGUL_MASK_RESET:
 		ret = stpmic1_regulator_mask_reset_set(desc->node_name);
 		break;
-	case REGUL_SINK_SOURCE:
+	case STPMIC1_REGUL_SINK_SOURCE:
 		ret = stpmic1_regulator_sink_mode_set(desc->node_name);
 		break;
-	case REGUL_ENABLE_BYPASS:
+	case STPMIC1_REGUL_ENABLE_BYPASS:
 		ret = stpmic1_regulator_bypass_mode_set(desc->node_name);
 		break;
 	default:
@@ -317,19 +349,19 @@ static TEE_Result driver_suspend(const struct regul_desc *desc, uint8_t state,
 	if (ret)
 		return TEE_ERROR_GENERIC;
 
-	if ((state & LP_STATE_OFF) != 0U) {
+	if ((state & STPMIC1_LP_STATE_OFF) != 0U) {
 		ret = stpmic1_lp_reg_on_off(desc->node_name, 0);
 		if (ret)
 			return TEE_ERROR_GENERIC;
 	}
 
-	if ((state & LP_STATE_ON) != 0U) {
+	if ((state & STPMIC1_LP_STATE_ON) != 0U) {
 		ret = stpmic1_lp_reg_on_off(desc->node_name, 1);
 		if (ret)
 			return TEE_ERROR_GENERIC;
 	}
 
-	if ((state & LP_STATE_SET_VOLT) != 0U) {
+	if ((state & STPMIC1_LP_STATE_SET_VOLT) != 0U) {
 		ret = stpmic1_lp_set_voltage(desc->node_name, mv);
 		if (ret)
 			return TEE_ERROR_GENERIC;
@@ -337,6 +369,12 @@ static TEE_Result driver_suspend(const struct regul_desc *desc, uint8_t state,
 
 	return 0;
 }
+
+struct regu_handle_s {
+	struct regul_desc *desc;
+	uint8_t lp_state[STM32_PM_MAX_SOC_MODE];
+	uint16_t lp_mv[STM32_PM_MAX_SOC_MODE];
+};
 
 const struct regul_ops pmic_ops = {
 	.set_state = pmic_set_state,
@@ -347,7 +385,6 @@ const struct regul_ops pmic_ops = {
 	.set_flag = pmic_set_flag,
 	.lock = driver_lock,
 	.unlock = driver_unlock,
-	.suspend = driver_suspend,
 };
 
 #define DEFINE_REGU(name) { \
@@ -363,7 +400,6 @@ static const struct regul_ops pmic_sw_ops = {
 	.set_flag = pmic_set_flag,
 	.lock = driver_lock,
 	.unlock = driver_unlock,
-	.suspend = driver_suspend,
 };
 
 #define DEFINE_SWITCH(name) { \
@@ -372,7 +408,7 @@ static const struct regul_ops pmic_sw_ops = {
 	.enable_ramp_delay_us = 1000, \
 }
 
-static const struct regul_desc pmic_reguls[] = {
+static struct regul_desc pmic_reguls[] = {
 	DEFINE_REGU("buck1"),
 	DEFINE_REGU("buck2"),
 	DEFINE_REGU("buck3"),
@@ -390,10 +426,129 @@ static const struct regul_desc pmic_reguls[] = {
 };
 DECLARE_KEEP_PAGER(pmic_reguls);
 
-static TEE_Result register_pmic_regulator(const char *regu_name, int node)
+struct regul_property {
+	const char *name;
+	uint16_t flag;
+};
+
+static struct regul_property flag_prop[] = {
+	{
+		.name = "st,mask-reset",
+		.flag = STPMIC1_REGUL_MASK_RESET,
+	},
+	{
+		.name = "st,regulator-sink-source",
+		.flag = STPMIC1_REGUL_SINK_SOURCE,
+	},
+	{
+		.name = "st,regulator-bypass",
+		.flag = STPMIC1_REGUL_ENABLE_BYPASS,
+	},
+};
+
+static TEE_Result parse_properties(const void *fdt,
+				   const struct regul_desc *desc, int node)
+{
+	TEE_Result res = TEE_ERROR_GENERIC;
+	struct regul_property *p = NULL;
+
+	stm32mp_get_pmic();
+
+	for (p = flag_prop; p < (flag_prop + ARRAY_SIZE(flag_prop)); p++) {
+		if (fdt_getprop(fdt, node, p->name, NULL)) {
+			FMSG("%s: %#"PRIx32, desc->node_name, p->flag);
+
+			res = pmic_set_flag(desc, p->flag);
+			if (res)
+				return res;
+		}
+	}
+
+	stm32mp_put_pmic();
+
+	return TEE_SUCCESS;
+}
+
+static void parse_low_power_mode(const void *fdt,
+				 const struct regul_desc *desc,
+				 int node, int mode)
+{
+	struct regu_handle_s *regu = (struct regu_handle_s *)desc->driver_data;
+	const fdt32_t *cuint = NULL;
+
+	regu->lp_state[mode] = 0;
+
+	if (fdt_getprop(fdt, node, "regulator-off-in-suspend", NULL)) {
+		FMSG("%s: mode:%d OFF", desc->node_name, mode);
+		regu->lp_state[mode] |= STPMIC1_LP_STATE_OFF;
+	} else if (fdt_getprop(fdt, node, "regulator-on-in-suspend", NULL)) {
+		FMSG("%s: mode:%d ON", desc->node_name, mode);
+		regu->lp_state[mode] |= STPMIC1_LP_STATE_ON;
+	} else {
+		regu->lp_state[mode] |= STPMIC1_LP_STATE_UNCHANGED;
+	}
+
+	cuint = fdt_getprop(fdt, node, "regulator-suspend-microvolt", NULL);
+	if (cuint) {
+		uint16_t mv = (uint16_t)(fdt32_to_cpu(*cuint) / 1000U);
+
+		FMSG("%s: mode:%d suspend mv=%"PRIu16, desc->node_name,
+		     mode, mv);
+
+		regu->lp_state[mode] |= STPMIC1_LP_STATE_SET_VOLT;
+		regu->lp_mv[mode] = mv;
+	}
+}
+
+static void parse_low_power_modes(const void *fdt,
+				  const struct regul_desc *desc, int node)
+{
+	int mode_count = STM32_PM_MAX_SOC_MODE;
+	int mode = 0;
+
+	for (mode = 0; mode < mode_count; mode++) {
+		const char *lp_mode_name = plat_get_lp_mode_name(mode);
+
+		if (lp_mode_name) {
+			int n = 0;
+
+			/* Get the configs from regulator_state_node subnode */
+			n = fdt_subnode_offset(fdt, node, lp_mode_name);
+			if (n >= 0)
+				parse_low_power_mode(fdt, desc, n, mode);
+		}
+	}
+}
+
+#ifdef CFG_PM
+static TEE_Result stpmic1_regu_pm(enum pm_op op, uint32_t pm_hint,
+				  const struct pm_callback_handle *pm_handle)
+{
+	TEE_Result res = TEE_SUCCESS;
+	struct regul_desc *desc = (struct regul_desc *)pm_handle->handle;
+	struct regu_handle_s *regu = (struct regu_handle_s *)desc->driver_data;
+
+	if (op == PM_OP_SUSPEND) {
+		stm32mp_get_pmic();
+
+		res = driver_suspend(desc, regu->lp_state[pm_hint],
+				     regu->lp_mv[pm_hint]);
+
+		stm32mp_put_pmic();
+	}
+
+	return res;
+}
+DECLARE_KEEP_PAGER(stpmic1_regu_pm);
+#endif
+
+static TEE_Result register_pmic_regulator(const void *fdt,
+					  const char *regu_name, int node)
 {
 	TEE_Result res = TEE_ERROR_GENERIC;
 	size_t i = 0;
+	struct regul_desc *desc = NULL;
+	struct regu_handle_s *regu = NULL;
 
 	for (i = 0; i < ARRAY_SIZE(pmic_reguls); i++)
 		if (!strcmp(pmic_reguls[i].node_name, regu_name))
@@ -401,9 +556,30 @@ static TEE_Result register_pmic_regulator(const char *regu_name, int node)
 
 	assert(i < ARRAY_SIZE(pmic_reguls));
 
-	res = regulator_register(pmic_reguls + i, node);
+	regu = calloc(1, sizeof(*regu));
+	if (!regu)
+		panic();
+
+	desc = &pmic_reguls[i];
+	desc->driver_data = regu;
+	regu->desc = desc;
+
+	res = parse_properties(fdt, desc, node);
 	if (res)
+		EMSG("Failed to parse properties for %s", regu_name);
+
+	parse_low_power_modes(fdt, desc, node);
+
+	res = regulator_register(desc, node);
+	if (res) {
 		EMSG("Failed to register %s, error: %#"PRIx32, regu_name, res);
+		free(regu);
+		return res;
+	}
+
+#ifdef CFG_PM
+	register_pm_core_service_cb(stpmic1_regu_pm, desc, desc->node_name);
+#endif
 
 	return res;
 }
@@ -474,11 +650,10 @@ static void register_non_secure_pmic(void)
 	}
 }
 
-static enum itr_return stpmic1_irq_handler(struct itr_handler *handler)
+static enum itr_return stpmic1_irq_handler(struct itr_handler *handler __unused)
 {
 	uint8_t read_val = 0U;
 	unsigned int i = 0U;
-	uint32_t *it_id = handler->data;
 
 	FMSG("Stpmic1 irq handler");
 
@@ -489,15 +664,22 @@ static enum itr_return stpmic1_irq_handler(struct itr_handler *handler)
 			panic();
 
 		if (read_val) {
+			struct pmic_it_handle_s *prv = NULL;
+
 			FMSG("Stpmic1 irq pending %u: %#"PRIx8, i, read_val);
 
 			if (stpmic1_register_write(ITCLEARLATCH1_REG + i,
 						   read_val))
 				panic();
 
-			/* Forward falling interrupt to non-secure */
-			if (i == 0 && (read_val & BIT(IT_PONKEY_F)) && it_id)
-				notif_send_it(*it_id);
+			SLIST_FOREACH(prv, &pmic_it_handle_list, link)
+				if ((prv->pmic_reg == ITCLEARMASK1_REG + i) &&
+				    (read_val & BIT(prv->pmic_bit))) {
+					FMSG("STPMIC1 send notif %u",
+					     prv->notif_id);
+
+					notif_send_it(prv->notif_id);
+				}
 		}
 	}
 
@@ -552,14 +734,106 @@ static void initialize_pmic(const void *fdt, int pmic_node)
 	stm32mp_put_pmic();
 }
 
+static TEE_Result stm32_pmic_init_it(const void *fdt, int node)
+{
+	TEE_Result res = TEE_ERROR_GENERIC;
+	const uint32_t *notif_ids = NULL;
+	int nb_notif = 0;
+	size_t pwr_it = 0;
+	struct itr_handler *hdl = NULL;
+	const fdt32_t *cuint = NULL;
+
+	cuint = fdt_getprop(fdt, node, "st,wakeup-pin-number", NULL);
+	if (!cuint) {
+		IMSG("Missing wake-up pin description");
+		return TEE_SUCCESS;
+	}
+
+	pwr_it = fdt32_to_cpu(*cuint) - 1U;
+
+	notif_ids = fdt_getprop(fdt, node, "st,notif-it-id", &nb_notif);
+	if (!notif_ids)
+		return TEE_ERROR_ITEM_NOT_FOUND;
+
+	if (nb_notif > 0) {
+		struct pmic_it_handle_s *prv = NULL;
+		unsigned int i = 0;
+		const uint32_t *pmic_its = NULL;
+		int nb_it = 0;
+
+		pmic_its = fdt_getprop(fdt, node, "st,pmic-it-id", &nb_it);
+		if (!pmic_its)
+			return TEE_ERROR_ITEM_NOT_FOUND;
+
+		if (nb_it != nb_notif)
+			panic("st,notif-it-id incorrect description");
+
+		for (i = 0; i < (nb_notif / sizeof(uint32_t)); i++) {
+			uint8_t val = 0;
+			uint8_t pmic_it = 0;
+
+			prv = calloc(1, sizeof(*prv));
+			if (!prv)
+				panic("pmic: Could not allocate pmic it");
+
+			pmic_it = fdt32_to_cpu(pmic_its[i]);
+
+			assert(pmic_it <= IT_SWIN_R);
+
+			prv->pmic_reg = ITCLEARMASK1_REG + pmic_it / U(8);
+			prv->pmic_bit = pmic_it % U(8);
+			prv->notif_id = fdt32_to_cpu(notif_ids[i]);
+
+			SLIST_INSERT_HEAD(&pmic_it_handle_list, prv, link);
+
+			stm32mp_get_pmic();
+
+			/* Enable requested interrupt */
+			if (stpmic1_register_read(prv->pmic_reg, &val))
+				panic();
+
+			val |= BIT(prv->pmic_bit);
+
+			if (stpmic1_register_write(prv->pmic_reg, val))
+				panic();
+
+			stm32mp_put_pmic();
+
+			FMSG("STPMIC1 forwards irq reg:%u bit:%u as notif:%u",
+			     prv->pmic_reg, prv->pmic_bit, prv->notif_id);
+		}
+	}
+
+	res = stm32mp1_pwr_itr_alloc_add(pwr_it, stpmic1_irq_handler,
+					 PWR_WKUP_FLAG_FALLING |
+					 PWR_WKUP_FLAG_THREADED,
+					 NULL, &hdl);
+	if (res)
+		panic("pmic: Could not allocate itr");
+
+	stm32mp1_pwr_itr_enable(hdl->it);
+
+	return res;
+}
+
 static TEE_Result stm32_pmic_probe(const void *fdt, int node,
 				   const void *compat_data __unused)
 {
 	TEE_Result res = TEE_SUCCESS;
 	const fdt32_t *cuint = NULL;
-	struct itr_handler *hdl = NULL;
-	size_t it = 0;
-	uint32_t *it_id = NULL;
+	int len = 0;
+	uint32_t phandle = 0;
+
+	if (IS_ENABLED(CFG_STM32MP13)) {
+		cuint = fdt_getprop(fdt, node, "wakeup-parent", &len);
+		if (!cuint || len != sizeof(uint32_t))
+			panic("Missing wakeup-parent");
+
+		phandle = fdt32_to_cpu(*cuint);
+		if (!dt_driver_get_provider_by_phandle(phandle,
+						       DT_DRIVER_NOTYPE))
+			return TEE_ERROR_DEFER_DRIVER_INIT;
+	}
 
 	res = i2c_dt_get_by_subnode(fdt, node, &i2c_pmic_handle);
 	if (res)
@@ -567,41 +841,8 @@ static TEE_Result stm32_pmic_probe(const void *fdt, int node,
 
 	initialize_pmic(fdt, node);
 
-	if (IS_ENABLED(CFG_STM32MP13)) {
-		cuint = fdt_getprop(fdt, node, "st,wakeup-pin-number", NULL);
-		if (!cuint) {
-			IMSG("Missing wake-up pin description");
-			return TEE_SUCCESS;
-		}
-
-		it = fdt32_to_cpu(*cuint) - 1U;
-
-		cuint = fdt_getprop(fdt, node, "st,notif-it-id", NULL);
-		if (cuint) {
-			it_id = calloc(1, sizeof(*it_id));
-			if (!it_id)
-				return TEE_ERROR_OUT_OF_MEMORY;
-
-			*it_id = fdt32_to_cpu(*cuint);
-		}
-
-		res = stm32mp1_pwr_itr_alloc_add(it, stpmic1_irq_handler,
-						 PWR_WKUP_FLAG_FALLING |
-						 PWR_WKUP_FLAG_THREADED,
-						 it_id, &hdl);
-		if (res)
-			panic("pmic: Couldn't allocate itr");
-
-		stm32mp1_pwr_itr_enable(hdl->it);
-
-		/* Enable ponkey irq */
-		stm32mp_get_pmic();
-		if (stpmic1_register_write(ITCLEARMASK1_REG,
-					   BIT(IT_PONKEY_F) | BIT(IT_PONKEY_R)))
-			panic();
-
-		stm32mp_put_pmic();
-	}
+	if (IS_ENABLED(CFG_STM32MP13))
+		res = stm32_pmic_init_it(fdt, node);
 
 	return res;
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * Copyright (c) 2018-2021, STMicroelectronics - All Rights Reserved
+ * Copyright (c) 2018-2024, STMicroelectronics - All Rights Reserved
  * Copyright (c) 2017-2021, ARM Limited and Contributors. All rights reserved.
  */
 
@@ -9,6 +9,7 @@
 #include <crypto/crypto.h>
 #include <drivers/clk.h>
 #include <drivers/gic.h>
+#include <drivers/stm32_rng.h>
 #include <drivers/stm32_rtc.h>
 #include <drivers/stm32mp_dt_bindings.h>
 #include <drivers/stm32mp1_ddrc.h>
@@ -43,8 +44,8 @@
  *
  * STANDBY_CONTEXT_MAGIC2:
  * Context provides MAGIC1 content, low power entry point, BL2 code start, end
- * and BL2_END (102 bytes). And, only for STM32MP13, add MCE master key
- * (16 bytes).
+ * and BL2_END (102 bytes). And, only for STM32MP13, add MCE master key seed
+ * (4 bytes).
  */
 #define STANDBY_CONTEXT_MAGIC0		(0x0001 << 16)
 #define STANDBY_CONTEXT_MAGIC1		(0x0002 << 16)
@@ -72,7 +73,7 @@
 #endif
 
 #if CFG_STM32MP1_PM_CONTEXT_VERSION >= 3 && defined(CFG_STM32MP13)
-#define MCE_KEY_SIZE_IN_BYTES		16
+#define MCE_SEED_SIZE_IN_BYTES		4
 #endif
 
 /*
@@ -126,7 +127,7 @@ struct pm_mailbox {
 	uint32_t bl2_code_end;
 	uint32_t bl2_end;
 #ifdef CFG_STM32MP13
-	uint8_t mce_mkey[MCE_KEY_SIZE_IN_BYTES];
+	uint8_t mce_seed[MCE_SEED_SIZE_IN_BYTES];
 #endif
 #endif
 };
@@ -197,7 +198,8 @@ static void save_time(void)
 
 	clk_enable(pm_clocks.rtc);
 
-	stm32_rtc_get_calendar(&plat_ctx.rtc);
+	if (stm32_rtc_get_calendar(&plat_ctx.rtc))
+		panic();
 }
 
 #if TRACE_LEVEL >= TRACE_DEBUG
@@ -228,9 +230,11 @@ static void restore_time(void)
 	vaddr_t stgen = stm32mp_stgen_base();
 	struct retram_resume_ctx __maybe_unused *ctx = get_retram_resume_ctx();
 
-	stm32_rtc_get_calendar(&current_calendar);
-	stdby_time_in_ms = stm32_rtc_diff_calendar(&current_calendar,
-						   &plat_ctx.rtc);
+	if (stm32_rtc_get_calendar(&current_calendar))
+		panic();
+
+	stdby_time_in_ms = stm32_rtc_diff_calendar_ms(&current_calendar,
+						      &plat_ctx.rtc);
 
 	cnt = ((uint64_t)plat_ctx.stgen_cnt_h << 32) | plat_ctx.stgen_cnt_l;
 	cnt += (stdby_time_in_ms * io_read32(stgen + CNTFID_OFFSET)) / 1000U;
@@ -342,7 +346,8 @@ __maybe_unused static void save_ddr_training_area(void)
  * structure must then be saved before going to STANDBY in the PM mailbox
  * shared with the warm boot boot stage.
  */
-#if CFG_STM32MP1_PM_CONTEXT_VERSION >= 2
+#if (CFG_STM32MP1_PM_CONTEXT_VERSION >= 2) && \
+    defined(CFG_STM32MP1_OPTEE_IN_SYSRAM)
 __maybe_unused static void save_pll1_settings(void)
 {
 	struct pm_mailbox *mailbox = get_pm_mailbox();
@@ -404,6 +409,15 @@ static void save_teeram_in_ddr(void)
 	if (!stm32mp_supports_hw_cryp())
 		panic();
 
+	if (IS_ENABLED(CFG_WITH_SOFTWARE_PRNG)) {
+		/*
+		 * Re-init STM32 RNG1 (including reset cycle) since non-secure
+		 * world may have loaded a weak configuration.
+		 */
+		if (stm32_rng_init())
+			panic();
+	}
+
 	assert(clk_is_enabled(pm_clocks.bkpsram) &&
 	       clk_is_enabled(pm_clocks.cryp1));
 
@@ -420,7 +434,7 @@ static void save_teeram_in_ddr(void)
 	ctx->rcc_base = (uint32_t)phys_to_virt(RCC_BASE, MEM_AREA_IO_SEC, 1);
 	ctx->stgen_base = (uint32_t)phys_to_virt(STGEN_BASE, MEM_AREA_IO_SEC, 1);
 
-	if (crypto_rng_read((uint8_t *)ccm->key, sizeof(ccm->key)))
+	if (stm32_rng_read((uint8_t *)ccm->key, sizeof(ccm->key)))
 		panic();
 
 	assert(((PM_CCM_TAG_FLAGS & ~0x38U) | (PM_CCM_Q_FLAGS & ~0x07U)) == 0);
@@ -428,7 +442,7 @@ static void save_teeram_in_ddr(void)
 	COMPILE_TIME_ASSERT(TEE_RAM_PH_SIZE > UINT16_MAX);
 	COMPILE_TIME_ASSERT(TEE_RAM_PH_SIZE < UINT32_MAX);
 
-	if (crypto_rng_read((uint8_t *)ccm->ctr1, sizeof(ccm->ctr1)))
+	if (stm32_rng_read((uint8_t *)ccm->ctr1, sizeof(ccm->ctr1)))
 		panic();
 
 	ccm->ctr1[0] &= GENMASK_32(24, 0);

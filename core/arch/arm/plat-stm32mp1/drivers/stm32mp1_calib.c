@@ -280,20 +280,20 @@ static void osc_calibration(struct stm32mp1_clk_cal *clk_cal)
 
 		clk_cal->set_trim(new_trim, clk_cal->cal_ref);
 		freq = get_freq(clk_cal);
-		if (freq == 0) {
-			/* Calibration will be stopped */
-			clk_cal->ref_freq = 0U;
-			return;
-		}
 		conv = (clk_cal->ref_freq < freq) ?
 			freq - clk_cal->ref_freq : clk_cal->ref_freq - freq;
 		if (conv < min_conv) {
 			min_conv = conv;
 			trim = new_trim;
+		} else if (conv == min_conv) {
+			break;
 		}
 
-		if (timeout_elapsed(timeout_ref))
+		if (timeout_elapsed(timeout_ref)) {
+			EMSG("%s Timeout: %lu , trim %i\n",
+			     clk_cal->name, freq, trim);
 			break;
+		}
 
 	} while (conv == min_conv);
 
@@ -301,10 +301,10 @@ static void osc_calibration(struct stm32mp1_clk_cal *clk_cal)
 
 	clk_cal->set_trim(trim, clk_cal->cal_ref);
 	freq = get_freq(clk_cal);
-	if (freq < min || freq > max) {
-		EMSG("Calibration failed: Freq %lu , trim %i\n", freq, trim);
-		panic();
-	}
+	if (freq < min || freq > max)
+		EMSG("%s Freq out of range: %lu , trim %i\n", clk_cal->name,
+		     freq, trim);
+
 }
 
 static void save_trim(struct stm32mp1_clk_cal *clk_cal,
@@ -565,7 +565,7 @@ static TEE_Result init_stm32mp1_calib(void)
 	return TEE_SUCCESS;
 }
 
-driver_init_late(init_stm32mp1_calib);
+service_init(init_stm32mp1_calib);
 
 typedef TEE_Result (*ta_func)(struct ts_session *s, uint32_t param_types,
 			      TEE_Param params[TEE_NUM_PARAMS]);
